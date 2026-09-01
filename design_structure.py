@@ -1,0 +1,829 @@
+"""Parse Lanhu Sketch/Figma/MasterGo JSON into a compact layer tree.
+
+Does not use DDS store_schema_revise, so it still works when
+「设计图转代码」is off and schema version data is missing.
+Coordinates and font sizes are converted to logical points via sliceScale.
+"""
+from typing import Optional, Union
+
+
+_FONT_WEIGHT_NAME_MAP = {
+    'thin': 100,
+    'ultralight': 200,
+    'light': 300,
+    'regular': 400,
+    'normal': 400,
+    'medium': 500,
+    'semibold': 600,
+    'demibold': 600,
+    'bold': 700,
+    'heavy': 800,
+    'black': 900,
+}
+
+
+def _round_pt(value, scale: float = 1.0):
+    if value is None:
+        return None
+    try:
+        number = float(value) / (scale or 1.0)
+    except (TypeError, ValueError):
+        return None
+    rounded = round(number, 1)
+    return int(rounded) if rounded == int(rounded) else rounded
+
+
+def _color_to_css(color) -> Optional[str]:
+    if not color:
+        return None
+    if isinstance(color, str):
+        return color
+    if not isinstance(color, dict):
+        return None
+    # 优先用 r/g/b 计算干净的整数值；MasterGo/DDS 的 value 字符串常带浮点脏值
+    # （如 rgba(34.00000177323818,...)），对 iOS 不可用。
+    r = color.get('r', color.get('red'))
+    g = color.get('g', color.get('green'))
+    b = color.get('b', color.get('blue'))
+    a = color.get('a', color.get('alpha', 1))
+    if r is not None and g is not None and b is not None:
+        if all(isinstance(item, (int, float)) and abs(item) <= 1 for item in (r, g, b)):
+            r, g, b = round(r * 255), round(g * 255), round(b * 255)
+        else:
+            r, g, b = round(float(r)), round(float(g)), round(float(b))
+        try:
+            alpha = float(a) if a is not None else 1
+        except (TypeError, ValueError):
+            alpha = 1
+        if alpha < 1:
+            return f"rgba({r},{g},{b},{round(alpha, 3)})"
+        return f"rgb({r},{g},{b})"
+    if color.get('value'):
+        return color['value']
+    return None
+
+
+def _first_fill_color(layer: dict) -> Optional[str]:
+    fills = []
+    style = layer.get('style')
+    if isinstance(style, dict):
+        fills.extend(style.get('fills') or [])
+    fills.extend(layer.get('fills') or [])
+    fill_obj = layer.get('fill')
+    if isinstance(fill_obj, dict):
+        fills.append(fill_obj)
+    for fill in fills:
+        if not isinstance(fill, dict) or fill.get('isEnabled') is False:
+            continue
+        css = _color_to_css(fill.get('color'))
+        if css:
+            return css
+    return None
+
+
+def _apply_alpha(css: Optional[str], alpha: float) -> Optional[str]:
+    """Fold a 0-1 alpha into an rgb() css string; leave rgba()/None untouched."""
+    if not css or alpha is None or alpha >= 1:
+        return css
+    if css.startswith('rgb(') and not css.startswith('rgba('):
+        inner = css[4:-1]
+        return f"rgba({inner},{round(alpha, 2)})"
+    return css
+
+
+def _extract_opacity(layer: dict) -> Optional[float]:
+    """Layer opacity as 0-1; None when fully opaque/absent. Handles Figma (0-1) and PSD blendOptions (0-100)."""
+    op = layer.get('opacity')
+    if op is None:
+        blend = layer.get('blendOptions')
+        if isinstance(blend, dict):
+            raw = blend.get('opacity')
+            if isinstance(raw, dict):
+                raw = raw.get('value')
+            if raw is not None:
+                try:
+                    raw = float(raw)
+                    op = raw / 100 if raw > 1 else raw
+                except (TypeError, ValueError):
+                    op = None
+    if op is None:
+        return None
+    try:
+        op = float(op)
+    except (TypeError, ValueError):
+        return None
+    if op > 1:  # DDS/PSD 用 0-100
+        op = op / 100
+    if op < 0 or op >= 1:
+        return None
+    return round(op, 2)
+
+
+def _extract_border(layer: dict, scale: float):
+    """Normalized border list [{thickness, color, position}]; None when absent.
+
+    Handles Figma/MasterGo/DDS `borders` list and PSD `layerEffects.frameFX`.
+    """
+    borders = []
+
+    raw = []
+    style = layer.get('style')
+    if isinstance(style, dict):
+        raw.extend(style.get('borders') or [])
+    raw.extend(layer.get('borders') or [])
+    for item in raw:
+        if not isinstance(item, dict) or item.get('isEnabled') is False:
+            continue
+        entry = {}
+        # MasterGo 用 width，DDS/Sketch 用 thickness/size
+        thickness = item.get('width', item.get('thickness', item.get('size')))
+        if thickness is not None:
+            entry['thickness'] = _round_pt(thickness, scale)
+        color = _color_to_css(item.get('color'))
+        opacity = item.get('opacity')
+        if color and isinstance(opacity, (int, float)) and opacity < 1:
+            color = _apply_alpha(color, opacity)
+        if color:
+            entry['color'] = color
+        # MasterGo 用 lineAlignment(center/inside/outside)，其他用 position
+        position = item.get('lineAlignment', item.get('position'))
+        if position not in (None, ''):
+            entry['position'] = position
+        line_style = item.get('style')
+        if isinstance(line_style, str) and line_style and line_style.lower() != 'solid':
+            entry['style'] = line_style
+        if entry:
+            borders.append(entry)
+
+    effects = layer.get('layerEffects')
+    frame_fx = effects.get('frameFX') if isinstance(effects, dict) else None
+    if isinstance(frame_fx, dict) and frame_fx.get('enabled', True):
+        entry = {}
+        size = frame_fx.get('size')
+        if size is not None:
+            entry['thickness'] = _round_pt(size, scale)
+        color = _color_to_css(frame_fx.get('color'))
+        opacity = frame_fx.get('opacity')
+        if isinstance(opacity, dict):
+            opacity = opacity.get('value')
+        if color and opacity is not None:
+            try:
+                color = _apply_alpha(color, float(opacity) / 100)
+            except (TypeError, ValueError):
+                pass
+        if color:
+            entry['color'] = color
+        position = {'outsetFrame': 'outside', 'insetFrame': 'inside', 'centeredFrame': 'center'}.get(frame_fx.get('style'))
+        if position:
+            entry['position'] = position
+        if entry:
+            borders.append(entry)
+
+    return borders or None
+
+
+def _extract_radius(layer: dict, scale: float, max_radius: Optional[float] = None):
+    """Corner radius in logical points; None when absent.
+
+    Returns a single number when all four corners are equal, otherwise
+    {topLeft, topRight, bottomRight, bottomLeft} for iOS maskedCorners.
+    `max_radius` (points, usually min(w,h)/2) caps「胶囊/圆形」的超大数值。
+    """
+    values = None
+
+    # MasterGo: 圆角在矢量 paths 里，paths[].radius = {topLeft,topRight,bottomLeft,bottomRight}
+    # 图层级 layer['radius'] 恒为 []，不能用。
+    for path in (layer.get('paths') or []):
+        if isinstance(path, dict) and isinstance(path.get('radius'), dict):
+            corner = path['radius']
+            raw = [corner.get('topLeft'), corner.get('topRight'),
+                   corner.get('bottomRight'), corner.get('bottomLeft')]
+            if any(isinstance(item, (int, float)) and item for item in raw):
+                values = [_round_pt(item or 0, scale) for item in raw]
+                break
+
+    if values is None:
+        radius = layer.get('radius')
+        if radius in (None, 0, [], {}):
+            style = layer.get('style')
+            if isinstance(style, dict):
+                radius = style.get('borderRadius') or style.get('radius')
+        if radius in (None, 0, [], {}):
+            radius = layer.get('cornerRadius')
+        if radius in (None, 0, [], {}):
+            return None
+        if isinstance(radius, (int, float)):
+            values = [_round_pt(radius, scale)] * 4
+        elif isinstance(radius, (list, tuple)) and radius:
+            converted = [_round_pt(item, scale) for item in radius]
+            values = (converted + [converted[-1]] * 4)[:4]
+        else:
+            return radius
+
+    if not values:
+        return None
+
+    if isinstance(max_radius, (int, float)) and max_radius > 0:
+        values = [min(item, max_radius) if isinstance(item, (int, float)) else item
+                  for item in values]
+
+    numeric = [item for item in values if isinstance(item, (int, float))]
+    if numeric and not any(numeric):
+        return None
+    if len(set(values)) == 1:
+        return values[0] or None
+    return {
+        'topLeft': values[0],
+        'topRight': values[1],
+        'bottomRight': values[2],
+        'bottomLeft': values[3],
+    }
+
+
+def _extract_shadow(layer: dict, scale: float):
+    """Normalized shadow list [{color, x, y, blur, spread, inset?}]; None when absent."""
+    import math
+    shadows = []
+
+    raw = list(layer.get('shadows') or [])
+    style = layer.get('style')
+    if isinstance(style, dict):
+        raw.extend(style.get('shadows') or [])
+    for item in raw:
+        if not isinstance(item, dict) or item.get('isEnabled') is False:
+            continue
+        entry = {}
+        color = _color_to_css(item.get('color'))
+        if color:
+            entry['color'] = color
+        for out_key, keys in (('x', ('offsetX', 'x')), ('y', ('offsetY', 'y')),
+                              ('blur', ('blurRadius', 'blur')), ('spread', ('spread', 'choke'))):
+            for key in keys:
+                if item.get(key) is not None:
+                    entry[out_key] = _round_pt(item.get(key), scale)
+                    break
+        if item.get('type') == 'inner' or item.get('inner') or item.get('inset'):
+            entry['inset'] = True
+        if entry:
+            shadows.append(entry)
+
+    effects = layer.get('layerEffects')
+    if isinstance(effects, dict):
+        for key, inset in (('dropShadow', False), ('dropShadowMulti', False),
+                           ('innerShadow', True), ('innerShadowMulti', True)):
+            data = effects.get(key)
+            items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            for item in items:
+                if not isinstance(item, dict) or not item.get('enabled', True):
+                    continue
+                entry = {}
+                color = _color_to_css(item.get('color'))
+                opacity = item.get('opacity')
+                if isinstance(opacity, dict):
+                    opacity = opacity.get('value')
+                if color and opacity is not None:
+                    try:
+                        color = _apply_alpha(color, float(opacity) / 100)
+                    except (TypeError, ValueError):
+                        pass
+                if color:
+                    entry['color'] = color
+                distance = item.get('distance', 0) or 0
+                angle = item.get('localLightingAngle', {})
+                angle = angle.get('value', 120) if isinstance(angle, dict) else (angle or 120)
+                rad = math.radians(angle)
+                entry['x'] = _round_pt(round(distance * math.cos(rad), 1), scale)
+                entry['y'] = _round_pt(round(distance * math.sin(rad), 1), scale)
+                if item.get('blur') is not None:
+                    entry['blur'] = _round_pt(item.get('blur'), scale)
+                if item.get('chokeMatte') is not None:
+                    entry['spread'] = _round_pt(item.get('chokeMatte'), scale)
+                if inset:
+                    entry['inset'] = True
+                if entry:
+                    shadows.append(entry)
+
+    return shadows or None
+
+
+_GRADIENT_TYPE_MAP = {0: 'linear', 1: 'radial', 2: 'angular', 3: 'diamond'}
+
+
+def _extract_gradient(layer: dict):
+    """Gradient fill as {type, stops:[{color, position}], from, to, angle}; None when no gradient fill.
+
+    `from`/`to` 为归一化色标手柄坐标，`angle` 为线性渐变方向角（度，屏幕坐标系，+x 向右、+y 向下）。
+    """
+    import math
+    fills = []
+    style = layer.get('style')
+    if isinstance(style, dict):
+        fills.extend(style.get('fills') or [])
+    fills.extend(layer.get('fills') or [])
+    for fill in fills:
+        if not isinstance(fill, dict) or fill.get('isEnabled') is False:
+            continue
+        is_gradient = fill.get('fillType') == 1 or fill.get('type') in ('gradient', 'Gradient') or fill.get('gradient')
+        if not is_gradient:
+            continue
+        gradient = fill.get('gradient') if isinstance(fill.get('gradient'), dict) else fill
+        raw_stops = gradient.get('stops') or gradient.get('colorStops') or gradient.get('colors') or []
+        stops = []
+        for stop in raw_stops:
+            if not isinstance(stop, dict):
+                continue
+            color = _color_to_css(stop.get('color') or stop)
+            entry = {}
+            if color:
+                entry['color'] = color
+            position = stop.get('position', stop.get('location'))
+            if position is not None:
+                entry['position'] = round(float(position), 3) if isinstance(position, (int, float)) else position
+            if entry:
+                stops.append(entry)
+        out = {}
+        gtype = gradient.get('gradientType')
+        if gtype is None:
+            gtype = gradient.get('type')
+        if isinstance(gtype, (int, float)) and int(gtype) in _GRADIENT_TYPE_MAP:
+            out['type'] = _GRADIENT_TYPE_MAP[int(gtype)]
+        elif isinstance(gtype, str) and gtype not in ('', 'gradient', 'Gradient'):
+            out['type'] = gtype
+        if stops:
+            out['stops'] = stops
+        frm, to = gradient.get('from'), gradient.get('to')
+        if isinstance(frm, dict) and isinstance(to, dict):
+            fx, fy = frm.get('x'), frm.get('y')
+            tx, ty = to.get('x'), to.get('y')
+            if None not in (fx, fy, tx, ty):
+                out['from'] = {'x': round(float(fx), 3), 'y': round(float(fy), 3)}
+                out['to'] = {'x': round(float(tx), 3), 'y': round(float(ty), 3)}
+                if out.get('type') == 'linear':
+                    out['angle'] = round(math.degrees(math.atan2(ty - fy, tx - fx)) % 360, 1)
+        if out:
+            return out
+    return None
+
+
+def _extract_blur(layer: dict, scale: float):
+    """Gaussian/background blur as {type, radius}; None when absent. iOS 毛玻璃/模糊效果。"""
+    raw = []
+    style = layer.get('style')
+    if isinstance(style, dict):
+        raw.extend(style.get('blurs') or [])
+    raw.extend(layer.get('blurs') or [])
+    for item in raw:
+        if not isinstance(item, dict) or item.get('isEnabled') is False:
+            continue
+        radius = item.get('radius', item.get('blur'))
+        if radius in (None, 0):
+            continue
+        entry = {'radius': _round_pt(radius, scale)}
+        blur_type = item.get('type')
+        if isinstance(blur_type, str) and blur_type:
+            entry['type'] = blur_type
+        return entry
+    return None
+
+
+def _extract_box_style(layer: dict, scale: float, frame: Optional[dict] = None) -> dict:
+    """填充色 / 渐变 / 边框 / 圆角 / 阴影 / 模糊 / 透明度 / 裁剪，容器与形状通用。"""
+    out = {}
+    fill = _first_fill_color(layer)
+    if fill:
+        out['color'] = fill
+    gradient = _extract_gradient(layer)
+    if gradient:
+        out['gradient'] = gradient
+    border = _extract_border(layer, scale)
+    if border:
+        out['border'] = border
+    max_radius = None
+    if isinstance(frame, dict):
+        fw, fh = frame.get('width'), frame.get('height')
+        if isinstance(fw, (int, float)) and isinstance(fh, (int, float)) and fw and fh:
+            max_radius = min(fw, fh) / 2
+    radius = _extract_radius(layer, scale, max_radius)
+    if radius not in (None, 0):
+        out['radius'] = radius
+    shadow = _extract_shadow(layer, scale)
+    if shadow:
+        out['shadow'] = shadow
+    blur = _extract_blur(layer, scale)
+    if blur:
+        out['blur'] = blur
+    opacity = _extract_opacity(layer)
+    if opacity is not None:
+        out['opacity'] = opacity
+    # 裁剪：iOS clipsToBounds / masksToBounds
+    if layer.get('clipped') is True or layer.get('hasClipMask') is True:
+        out['clip'] = True
+
+    # 旋转
+    rotation = layer.get('rotation', layer.get('rotate'))
+    if isinstance(rotation, (int, float)) and abs(rotation) > 0.01:
+        out['rotation'] = round(float(rotation), 1)
+
+    # 混合模式
+    blend = layer.get('blendMode')
+    if not blend:
+        blend_options = layer.get('blendOptions')
+        if isinstance(blend_options, dict):
+            blend = blend_options.get('mode') or blend_options.get('blendMode')
+    if isinstance(blend, str) and blend.strip().lower() not in ('', 'normal', 'passthrough', 'pass-through', 'sourceover'):
+        out['blendMode'] = blend
+
+    # 背景图 / 图片填充
+    fills = []
+    style = layer.get('style')
+    if isinstance(style, dict):
+        fills.extend(style.get('fills') or [])
+    fills.extend(layer.get('fills') or [])
+    for fill in fills:
+        if not isinstance(fill, dict) or fill.get('isEnabled') is False:
+            continue
+        image = fill.get('image')
+        image_url = image.get('imageUrl') if isinstance(image, dict) else (image if isinstance(image, str) else None)
+        image_url = image_url or fill.get('imageUrl')
+        if fill.get('fillType') == 2 or fill.get('type') in ('image', 'Image') or image_url:
+            if isinstance(image_url, str) and image_url:
+                out['backgroundImage'] = image_url
+            break
+
+    return out
+
+
+def _layout_metrics(frame: dict, children: list):
+    """Derive inner padding and relative gaps between children from their frames.
+
+    Returns (padding, gaps). padding = {left,top,right,bottom}; gaps = {axis, values}.
+    """
+    boxes = []
+    for child in children:
+        cx, cy, cw, ch = child.get('x'), child.get('y'), child.get('width'), child.get('height')
+        if None in (cx, cy, cw, ch):
+            continue
+        boxes.append((cx, cy, cx + cw, cy + ch))
+    if not boxes:
+        return None, None
+
+    padding = None
+    fx, fy, fw, fh = frame.get('x'), frame.get('y'), frame.get('width'), frame.get('height')
+    if None not in (fx, fy, fw, fh):
+        padding = {
+            'left': _round_pt(min(b[0] for b in boxes) - fx, 1),
+            'top': _round_pt(min(b[1] for b in boxes) - fy, 1),
+            'right': _round_pt((fx + fw) - max(b[2] for b in boxes), 1),
+            'bottom': _round_pt((fy + fh) - max(b[3] for b in boxes), 1),
+        }
+
+    gaps = None
+    if len(boxes) >= 2:
+        spread_x = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+        spread_y = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+        if spread_x >= spread_y:
+            ordered = sorted(boxes, key=lambda b: b[0])
+            values = [_round_pt(ordered[i][0] - ordered[i - 1][2], 1) for i in range(1, len(ordered))]
+            gaps = {'axis': 'horizontal', 'values': values}
+        else:
+            ordered = sorted(boxes, key=lambda b: b[1])
+            values = [_round_pt(ordered[i][1] - ordered[i - 1][3], 1) for i in range(1, len(ordered))]
+            gaps = {'axis': 'vertical', 'values': values}
+
+    return padding, gaps
+
+
+def _layer_frame(layer: dict, scale: float) -> dict:
+    frame = (
+        layer.get('frame')
+        or layer.get('realFrame')
+        or layer.get('bounds')
+        or layer.get('ddsOriginFrame')
+        or layer.get('layerOriginFrame')
+        or {}
+    )
+    left = frame.get('left', frame.get('x', layer.get('left', 0))) or 0
+    top = frame.get('top', frame.get('y', layer.get('top', 0))) or 0
+    width = frame.get('width', layer.get('width', 0)) or 0
+    height = frame.get('height', layer.get('height', 0)) or 0
+    return {
+        'x': _round_pt(left, scale),
+        'y': _round_pt(top, scale),
+        'width': _round_pt(width, scale),
+        'height': _round_pt(height, scale),
+    }
+
+
+def _normalize_font_weight(value) -> Optional[Union[int, str]]:
+    if value is None or value == '':
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    mapped = _FONT_WEIGHT_NAME_MAP.get(str(value).lower())
+    return mapped if mapped is not None else value
+
+
+def _extract_text_props(layer: dict, scale: float) -> dict:
+    """MasterGo artboard / Figma textStyle / Sketch textInfo."""
+    props = {}
+
+    raw_text = layer.get('text')
+    if isinstance(raw_text, dict):
+        style = raw_text.get('style') or {}
+        font = style.get('font') or raw_text.get('font') or {}
+        props['text'] = style.get('content') or raw_text.get('value') or raw_text.get('content') or ''
+        if font.get('size') is not None:
+            props['fontSize'] = _round_pt(font.get('size'), scale)
+        props['fontFamily'] = font.get('name') or font.get('postScriptName')
+        props['fontWeight'] = _normalize_font_weight(font.get('fontWeight') or font.get('type'))
+        props['align'] = font.get('align')
+        props['color'] = _color_to_css(style.get('color'))
+    elif isinstance(raw_text, str) and raw_text:
+        props['text'] = raw_text
+
+    text_style = layer.get('textStyle') or {}
+    if text_style:
+        props.setdefault('text', layer.get('textContent') or '')
+        if text_style.get('fontSize') is not None:
+            props['fontSize'] = _round_pt(text_style.get('fontSize'), scale)
+        if text_style.get('fontWeight') is not None:
+            props['fontWeight'] = _normalize_font_weight(text_style.get('fontWeight'))
+        if text_style.get('color'):
+            props['color'] = _color_to_css(text_style.get('color'))
+        if text_style.get('align'):
+            props['align'] = text_style.get('align')
+
+    text_info = layer.get('textInfo') or {}
+    if text_info:
+        if text_info.get('text'):
+            props['text'] = text_info.get('text')
+        if text_info.get('size') is not None:
+            props['fontSize'] = _round_pt(text_info.get('size'), scale)
+        props.setdefault('fontFamily', text_info.get('fontPostScriptName') or text_info.get('fontName'))
+        if text_info.get('bold') and not props.get('fontWeight'):
+            props['fontWeight'] = 700
+        if text_info.get('color'):
+            props.setdefault('color', _color_to_css(text_info.get('color')))
+        if text_info.get('justification'):
+            props.setdefault('align', text_info.get('justification'))
+
+    # 行高 / 字间距 / 斜体（各来源尽力取，逻辑点）
+    font = {}
+    if isinstance(raw_text, dict):
+        font = (raw_text.get('style') or {}).get('font') or raw_text.get('font') or {}
+    for src in (font, text_style, text_info):
+        if not isinstance(src, dict):
+            continue
+        if props.get('lineHeight') is None:
+            line_height = src.get('lineHeight', src.get('leading'))
+            if isinstance(line_height, (int, float)) and line_height not in (None, 0):
+                props['lineHeight'] = _round_pt(line_height, scale)
+        if props.get('letterSpacing') is None:
+            letter_spacing = src.get('letterSpacing', src.get('tracking'))
+            if isinstance(letter_spacing, dict):  # MasterGo: {value, unit}
+                letter_spacing = letter_spacing.get('value')
+            if isinstance(letter_spacing, (int, float)) and letter_spacing != 0:
+                props['letterSpacing'] = _round_pt(letter_spacing, scale)
+        if not props.get('italic'):
+            style_name = src.get('type') if isinstance(src.get('type'), str) else ''
+            if src.get('italic') or 'italic' in style_name.lower():
+                props['italic'] = True
+        if not props.get('underline'):
+            underline = src.get('underline')
+            if underline not in (None, 0, False, ''):
+                props['underline'] = True
+        if not props.get('strikethrough'):
+            strike = src.get('linethrough', src.get('strikethrough'))
+            if strike not in (None, 0, False, ''):
+                props['strikethrough'] = True
+
+    if not props.get('color'):
+        props['color'] = _first_fill_color(layer)
+
+    return {key: value for key, value in props.items() if value not in (None, '')}
+
+
+def _classify_slice(width, height) -> str:
+    """切图按尺寸(逻辑 pt)分类：icon / bg / img。借鉴 starql/lanhu-mcp 的 bg/icon/img 思路，
+    阈值按 iOS 逻辑点调整：长边 ≤64pt 视为图标，长边 ≥300pt(接近/超过屏宽)视为背景大图，其余为普通图片。"""
+    long_side = max(width or 0, height or 0)
+    if long_side and long_side <= 64:
+        return 'icon'
+    if long_side and long_side >= 300:
+        return 'bg'
+    return 'img'
+
+
+def _collect_subtree(nodes: list):
+    """遍历输出树，重新汇总其中的 texts 与 slices（用于按需裁剪后的准确汇总）。"""
+    texts, slices = [], []
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        if node.get('type') == 'text':
+            texts.append({key: node[key] for key in node if key != 'children'})
+        elif node.get('type') == 'image' and node.get('imageUrl'):
+            slices.append({key: node[key] for key in
+                           ('name', 'path', 'imageUrl', 'format', 'category', 'width', 'height', 'x', 'y')
+                           if key in node})
+        for child in node.get('children') or []:
+            walk(child)
+
+    for node in nodes:
+        walk(node)
+    return texts, slices
+
+
+def _prune_depth(nodes: list, max_depth: Optional[int], _depth: int = 1) -> list:
+    """按 max_depth 截断输出树；被截断的 container 标记 truncated 与 childCount。"""
+    if not max_depth or max_depth <= 0:
+        return nodes
+    out = []
+    for node in nodes:
+        clone = dict(node)
+        children = clone.get('children')
+        if children:
+            if _depth >= max_depth:
+                clone['childCount'] = len(children)
+                clone['truncated'] = True
+                clone.pop('children', None)
+            else:
+                clone['children'] = _prune_depth(children, max_depth, _depth + 1)
+        out.append(clone)
+    return out
+
+
+def _find_subtree(nodes: list, node_path: str) -> Optional[dict]:
+    """按 path 精确定位一个节点子树，找不到返回 None。"""
+    for node in nodes:
+        if node.get('path') == node_path:
+            return node
+        found = _find_subtree(node.get('children') or [], node_path)
+        if found:
+            return found
+    return None
+
+
+def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
+                           node_path: Optional[str] = None) -> dict:
+    """
+    Build a compact layer tree from raw Lanhu design JSON.
+
+    Returns logical-point frames and font sizes. Nested groups are always
+    walked, including groups that also have export images.
+
+    按需加载（省 token）：
+      - max_depth: 只输出到指定层级，更深的 container 标记 truncated+childCount。
+      - node_path: 只输出该 path 起始的子树（配合上一次结果里的 path 逐分支展开）。
+    切图内联：image 节点带 imageUrl/format/category，并在顶层 slices 汇总。
+    """
+    meta = sketch_data.get('meta') or {}
+    slice_scale = float(
+        sketch_data.get('sliceScale')
+        or sketch_data.get('exportScale')
+        or meta.get('sliceScale')
+        or 2
+    )
+    host = (meta.get('host') or {}).get('name') if isinstance(meta.get('host'), dict) else meta.get('host')
+    is_figma = host == 'figma'
+    texts = []
+
+    def _should_skip(layer: dict) -> bool:
+        if not layer or not isinstance(layer, dict):
+            return True
+        if layer.get('visible') is False or layer.get('isVisible') is False:
+            return True
+        if layer.get('opacity') == 0:
+            return True
+        name = str(layer.get('name') or '')
+        return name.startswith('__lanhu') or name.startswith('_annotation')
+
+    def _process(layer: dict, parent_path: str = "") -> Optional[dict]:
+        if _should_skip(layer):
+            return None
+
+        name = layer.get('name') or ''
+        path = f"{parent_path}/{name}" if parent_path else name
+        layer_type = (layer.get('type') or layer.get('layerType') or '').strip()
+        frame = _layer_frame(layer, slice_scale)
+        node = {
+            'name': name,
+            'path': path,
+            'type': layer_type or 'unknown',
+            **frame,
+        }
+
+        children_raw = layer.get('layers') or layer.get('children') or []
+        is_group = layer_type in (
+            'groupLayer', 'layerSection', 'artboard', 'symbolInstence', 'symbolInstance'
+        )
+        is_text = layer_type in ('textLayer', 'text') or bool(
+            layer.get('textInfo') or layer.get('textStyle') or layer.get('text')
+        )
+
+        if is_text and not is_group:
+            node['type'] = 'text'
+            node.update(_extract_text_props(layer, slice_scale))
+            texts.append({key: node[key] for key in node if key != 'children'})
+            return node
+
+        # 补充：容器/形状统一提取填充色、边框、圆角、阴影、模糊、透明度、裁剪
+        # （原本容器有 children 就丢掉了这些）。frame 用于胶囊圆角封顶。
+        node.update(_extract_box_style(layer, slice_scale, frame))
+
+        children = []
+        for child in children_raw:
+            parsed = _process(child, path)
+            if parsed:
+                children.append(parsed)
+        if children:
+            node['type'] = 'container'
+            node['children'] = children
+            padding, gaps = _layout_metrics(frame, children)
+            if padding is not None:
+                node['padding'] = padding
+            if gaps is not None:
+                node['gaps'] = gaps
+            return node
+
+        # 任意可见的盒子样式都说明这是一个需要绘制的形状（含仅渐变/仅阴影等），不能丢
+        if any(node.get(key) for key in
+               ('color', 'gradient', 'border', 'radius', 'shadow', 'blur', 'backgroundImage')):
+            node['type'] = 'shape'
+            return node
+
+        # 切图内联：真切图 = image.imageUrl/svgUrl（Figma 需 hasExportImage，
+        # 图片填充层的 ddsImage 不算切图，已在 backgroundImage 处理）
+        image = layer.get('image') or {}
+        image_url = image.get('imageUrl') or image.get('svgUrl')
+        if image_url and (not is_figma or layer.get('hasExportImage')):
+            node['type'] = 'image'
+            node['imageUrl'] = image_url
+            node['format'] = 'png' if image.get('imageUrl') else 'svg'
+            node['category'] = _classify_slice(frame.get('width'), frame.get('height'))
+            return node
+        if layer.get('hasExportImage'):
+            node['type'] = 'image'
+            return node
+
+        if is_group:
+            node['type'] = 'container'
+            return node
+        return None
+
+    root_layers = []
+    artboard = sketch_data.get('artboard')
+    board = sketch_data.get('board')
+    artboard_info = None
+    if isinstance(artboard, dict):
+        artboard_info = {
+            'name': artboard.get('name'),
+            **_layer_frame(artboard, slice_scale),
+        }
+        root_layers = artboard.get('layers') or []
+    elif isinstance(board, dict):
+        artboard_info = {
+            'name': sketch_data.get('psdName') or board.get('name'),
+            'x': 0,
+            'y': 0,
+            'width': _round_pt(board.get('width'), slice_scale),
+            'height': _round_pt(board.get('height'), slice_scale),
+        }
+        root_layers = board.get('layers') or []
+    elif sketch_data.get('layers'):
+        root_layers = sketch_data['layers']
+    elif isinstance(sketch_data.get('info'), list):
+        root_layers = sketch_data['info']
+
+    nodes = [node for node in (_process(layer) for layer in root_layers) if node]
+
+    # 按需裁剪：先定位子树，再按深度截断
+    truncated_root = False
+    if node_path:
+        subtree = _find_subtree(nodes, node_path)
+        nodes = [subtree] if subtree else []
+    if max_depth:
+        nodes = _prune_depth(nodes, max_depth)
+        truncated_root = True
+
+    # 汇总基于最终输出树，保证 texts/slices 与 nodes 一致
+    out_texts, out_slices = _collect_subtree(nodes)
+
+    result = {
+        'sliceScale': int(slice_scale) if slice_scale == int(slice_scale) else slice_scale,
+        'host': host,
+        'artboard': artboard_info,
+        'textCount': len(out_texts),
+        'texts': out_texts,
+        'sliceCount': len(out_slices),
+        'slices': out_slices,
+        'nodes': nodes,
+    }
+    if node_path:
+        result['nodePath'] = node_path
+        if not nodes:
+            result['note'] = f'未找到 path={node_path} 的节点'
+    if max_depth and truncated_root:
+        result['maxDepth'] = max_depth
+    return result
