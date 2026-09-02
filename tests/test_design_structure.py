@@ -216,3 +216,22 @@ def test_on_demand_max_depth_and_node_path():
     sub = parse_design_structure(sketch, node_path='外层/内层')
     assert len(sub['nodes']) == 1 and sub['nodes'][0]['name'] == '内层'
     assert sub['nodePath'] == '外层/内层'
+
+
+def test_gaps_direction_and_folding():
+    # 三个等间距横向排列的兄弟 -> direction=row + 单个 gap（折叠）
+    def sq(name, left):
+        return _mastergo_shape(name, 20, 20, left=left, top=0,
+                               fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}])
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 40},
+                     'layers': [{
+                         'name': '行', 'type': 'groupLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 20}, 'radius': [],
+                         'layers': [sq('a', 0), sq('b', 30), sq('c', 60)],  # 间距均为 10
+                     }]},
+    }
+    row = parse_design_structure(sketch)['nodes'][0]
+    assert row['gaps'] == {'direction': 'row', 'gap': 10}

@@ -6248,7 +6248,8 @@ async def lanhu_get_design_structure(
        逐图层覆盖 DDS/图片推断出来的值。DDS 失败时，本工具即为唯一可靠来源。
 
     每个节点枚举的属性（坐标/字号均为逻辑点 pt，颜色为干净的 rgb()/rgba()）：
-      - 布局: x, y, width, height（画板绝对坐标）；container 附 padding{left,top,right,bottom} 与 gaps{axis,values}（相对关系）
+      - 布局: x, y, width, height（画板绝对坐标）；container 附 padding{left,top,right,bottom}(子相对父) 与
+              gaps{direction:row|column, gap 或 gaps[]}(兄弟排列方向+间距，直接对应 UIStackView/LinearLayout)
       - 外观: color(背景/填充), gradient{type,stops,from,to,angle}, border[{thickness,color,position,style}],
               radius(数值或 {topLeft,topRight,bottomRight,bottomLeft}), shadow[{color,x,y,blur,spread,inset}],
               blur{type,radius}, opacity, rotation, blendMode, clip(clipsToBounds), backgroundImage/imageUrl
@@ -6261,6 +6262,8 @@ async def lanhu_get_design_structure(
     按需加载（省 token，可选）：
       - max_depth=N: 只输出到第 N 层，更深容器标记 truncated+childCount；先浅拉骨架，再展开。
       - node_path="A/B/C": 只输出该节点子树（path 取自上一次结果的 node.path）。
+      - 大稿自动保护：未指定上述参数时，若完整结果过大(超 MCP 输出上限)，自动只内联浅骨架并置
+        truncatedForTokens=true，完整树写入 savedTo 文件；按提示用 node_path 展开或读该文件。
 
     USE THIS WHEN: 生成 iOS/Android/Flutter 代码, 需要精确的颜色/圆角/边框/阴影/间距/字号, 切图清单, 设计结构, 图层树, DDS失败兜底
     DO NOT USE for: 仅需批量下载切图文件 (可用 lanhu_get_design_slices；本工具已给切图 URL)
@@ -6329,7 +6332,8 @@ async def lanhu_get_design_structure(
                 '请把每个节点的属性精确叠加到代码——iOS: color→backgroundColor, radius→layer.cornerRadius(dict 用 maskedCorners), '
                 'border→layer.borderWidth/borderColor, shadow→layer.shadow*, blur→UIVisualEffectView, '
                 'opacity→alpha, clip→clipsToBounds, gradient→CAGradientLayer(用 angle/from/to 定方向)。'
-                'padding/gaps 为父子相对关系，x/y 为画板绝对坐标，二者结合还原布局。'
+                'padding 为子相对父边距，gaps{direction,gap} 为兄弟排列方向+间距(对应 UIStackView/LinearLayout)，'
+                'x/y 为画板绝对坐标，三者结合还原父子/兄弟布局。'
             ),
             **parsed,
         }
@@ -6340,6 +6344,37 @@ async def lanhu_get_design_structure(
         with open(json_path, 'w', encoding='utf-8') as handle:
             json.dump(result, handle, ensure_ascii=False, indent=2)
         result['savedTo'] = str(json_path)
+
+        # 大输出保护：完整结构树已存盘。若内联结果过大（超过 MCP 客户端 tool 输出
+        # token 上限，常见 25000），自动降级为浅骨架，避免截断/失败；AI 再用 node_path
+        # 逐分支展开，或直接读取 savedTo 完整文件。仅在未显式按需拉取时触发。
+        MAX_INLINE_CHARS = 45000
+        if not max_depth and not node_path and len(json.dumps(result, ensure_ascii=False)) > MAX_INLINE_CHARS:
+            for depth in (3, 2, 1):
+                skeleton = parse_design_structure(sketch_data, max_depth=depth)
+                slim = {
+                    'status': 'success',
+                    'designName': target.get('name'),
+                    'designId': target.get('id'),
+                    'unit': 'pt',
+                    'truncatedForTokens': True,
+                    'savedTo': str(json_path),
+                    'hint': (
+                        f'设计稿较大，完整结构树已存盘（savedTo）。为规避 MCP 输出 token 上限，'
+                        f'仅内联到第 {depth} 层骨架（truncated 容器带 childCount）。'
+                        f'需要细节时：对目标容器传 node_path 展开，或直接读取 savedTo 文件。'
+                    ),
+                    'sliceScale': skeleton.get('sliceScale'),
+                    'host': skeleton.get('host'),
+                    'artboard': skeleton.get('artboard'),
+                    'sliceCount': parsed.get('sliceCount'),
+                    'slices': parsed.get('slices'),
+                    'textCount': parsed.get('textCount'),
+                    'maxDepth': depth,
+                    'nodes': skeleton.get('nodes'),
+                }
+                if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= MAX_INLINE_CHARS:
+                    return slim
         return result
     except Exception as exc:
         return {

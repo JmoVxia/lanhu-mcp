@@ -8,9 +8,9 @@
 
 - **不依赖 DDS，稳定不失败**：`lanhu_get_design_structure` 直接清洗原始 Sketch / Figma / MasterGo JSON，DDS `store_schema_revise` 失败也不影响。
 - **属性齐全（面向客户端）**：坐标 / 尺寸 / 字号统一为逻辑点 `pt`，颜色为干净的 `rgb()/rgba()`。枚举 颜色、渐变（含方向 angle）、边框、逐角圆角、阴影（含内阴影）、模糊、透明度、旋转、裁剪、字体全套。
-- **层次结构 + 相对关系**：嵌套 `children` 图层树；容器带 `padding`（子相对父）与 `gaps`（兄弟间距），配合绝对坐标 `x/y` 完整还原布局。
+- **父子 + 兄弟布局**：嵌套 `children` 图层树；容器带 `padding`（子相对父边距）与 `gaps{direction:row|column, gap}`（兄弟排列方向+间距，等间距自动折叠），直接对应 `UIStackView` / `LinearLayout`，配合绝对坐标 `x/y` 完整还原布局。
 - **切图内联**：图片节点直接带下载 `imageUrl` 与分类（`icon` / `bg` / `img`），顶层 `slices[]` 汇总，一次拿全，无需再走 DDS。
-- **按需加载省 token**：`max_depth` 先拉骨架，`node_path` 再逐分支展开，避免一次吐出整棵大树。
+- **按需加载省 token**：`max_depth` 先拉骨架，`node_path` 再逐分支展开；大稿**自动降级**为浅骨架 + 存盘完整树（`truncatedForTokens`），规避 MCP 输出 token 上限截断。
 
 ## 🧰 工具一览
 
@@ -93,7 +93,7 @@ https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=xxx
 
 坐标 / 尺寸 / 字号均为逻辑点 `pt`，颜色为干净的 `rgb()/rgba()`。
 
-- **布局**：`x, y, width, height`（画板绝对坐标）；容器附 `padding{left,top,right,bottom}` 与 `gaps{axis,values}`（相对关系）
+- **布局**：`x, y, width, height`（画板绝对坐标）；容器附 `padding{left,top,right,bottom}`（子相对父）与 `gaps{direction:row|column, gap 或 gaps[]}`（兄弟排列方向+间距）
 - **外观**：`color` · `gradient{type,stops,from,to,angle}` · `border[{thickness,color,position,style}]` · `radius`（数值或 `{topLeft,topRight,bottomRight,bottomLeft}`）· `shadow[{color,x,y,blur,spread,inset}]` · `blur{type,radius}` · `opacity` · `rotation` · `blendMode` · `clip` · `backgroundImage`
 - **文本**：`text, fontSize, fontFamily, fontWeight, color, align, lineHeight, letterSpacing, italic, underline, strikethrough`
 - **切图**：`image` 节点内联 `imageUrl / format / category`；顶层 `slices[]` 汇总

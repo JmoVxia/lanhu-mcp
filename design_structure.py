@@ -456,7 +456,8 @@ def _extract_box_style(layer: dict, scale: float, frame: Optional[dict] = None) 
 def _layout_metrics(frame: dict, children: list):
     """Derive inner padding and relative gaps between children from their frames.
 
-    Returns (padding, gaps). padding = {left,top,right,bottom}; gaps = {axis, values}.
+    Returns (padding, gaps). padding = {left,top,right,bottom};
+    gaps = {direction: row|column, gap} 等间距，或 {direction, gaps:[...]} 不等间距。
     """
     boxes = []
     for child in children:
@@ -484,11 +485,17 @@ def _layout_metrics(frame: dict, children: list):
         if spread_x >= spread_y:
             ordered = sorted(boxes, key=lambda b: b[0])
             values = [_round_pt(ordered[i][0] - ordered[i - 1][2], 1) for i in range(1, len(ordered))]
-            gaps = {'axis': 'horizontal', 'values': values}
+            direction = 'row'
         else:
             ordered = sorted(boxes, key=lambda b: b[1])
             values = [_round_pt(ordered[i][1] - ordered[i - 1][3], 1) for i in range(1, len(ordered))]
-            gaps = {'axis': 'vertical', 'values': values}
+            direction = 'column'
+        # 语义化 + 折叠：row/column 对应 iOS UIStackView / Android LinearLayout；
+        # 等间距压成单个 gap（省 token），不等则保留 gaps 数组。
+        if values and len(set(values)) == 1:
+            gaps = {'direction': direction, 'gap': values[0]}
+        else:
+            gaps = {'direction': direction, 'gaps': values}
 
     return padding, gaps
 
