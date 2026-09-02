@@ -4,6 +4,15 @@
 
 > 核心思路：直接读取蓝湖原始设计 JSON，**不依赖 DDS「设计图转代码」**。即使设计师没有开启「设计图转代码」，也能稳定拿到完整、精确的属性。
 
+## 🧭 架构原则：不依赖 DDS
+
+这是本项目的**架构级约束**，不是可选项：
+
+- **为什么**：大量上传到蓝湖的设计稿并未开启「设计图转代码」（转码 / DDS `store_schema_revise`）。凡是以 DDS 为主链路的方案，遇到这类稿子就会失败或残缺。
+- **怎么做**：核心链路一律走 `/api/project/image` 的原始设计 JSON（`get_sketch_json`），由本地解析器 `design_structure.py` 清洗成图层树。`lanhu_get_design_structure`、`lanhu_get_design_slices` 全程零 DDS，任何稿子都能用。
+- **边界**：仅 `lanhu_get_ai_analyze_design_result`（生成 HTML，可选/遗留能力）会尝试 DDS，且 DDS 不可用时**自动降级**为基于原始 JSON 的 sketch-HTML，不会硬依赖。
+- **结论**：客户端出码请以 `lanhu_get_design_structure` 为准（DDS-free）。
+
 ## ✨ 特性
 
 - **不依赖 DDS，稳定不失败**：`lanhu_get_design_structure` 直接清洗原始 Sketch / Figma / MasterGo JSON，DDS `store_schema_revise` 失败也不影响。

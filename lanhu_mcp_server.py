@@ -5679,7 +5679,10 @@ async def lanhu_get_ai_analyze_design_result(
 ) -> List[Union[str, Image]]:
     """
     [UI Design] Analyze Lanhu UI design images - GET VISUAL CONTENT + HTML CODE
-    
+
+    ⚠️ 可选/遗留能力：本工具会尝试 DDS 生成 HTML（DDS 不可用时自动降级为原始 JSON 的 sketch-HTML）。
+       架构原则上核心链路不依赖 DDS——客户端出码请优先用 lanhu_get_design_structure（DDS-free、属性权威）。
+
     USE THIS WHEN user says: UI设计图, 设计图, 设计稿, 视觉设计, UI稿, 看看设计, 帮我看设计图, 设计评审
     DO NOT USE for: 需求文档, PRD, 原型, 交互稿, Axure (use lanhu_get_ai_analyze_page_result instead)
     DO NOT USE for: 切图, 图标, 素材 (use lanhu_get_design_slices instead)
