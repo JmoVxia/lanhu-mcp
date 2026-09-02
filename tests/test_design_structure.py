@@ -368,6 +368,79 @@ def test_psd_slice_images_captured():
     assert node['imageUrl'] == 'https://cdn/max_abc' and node['format'] == 'png'
 
 
+def test_text_cr_normalized_and_bad_lineheight_dropped():
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 40},
+                     'layers': [{
+                         'name': 't', 'type': 'textLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 90, 'height': 30},
+                         'text': {'style': {'content': '第一行\r\r第二行', 'font': {
+                             'name': 'PingFang', 'size': 42, 'lineHeight': 35}}},
+                     }]},
+    }
+    t = parse_design_structure(sketch)['texts'][0]
+    assert '\r' not in t['text'] and t['text'] == '第一行\n\n第二行'  # \r 归一化
+    assert 'lineHeight' not in t  # 35 < 42 → 省略（避免削顶）
+
+
+def test_negative_padding_clamped_and_oversized_child_excluded():
+    # 子在 y=0、父在 y=200 的超大误嵌层 -> 不产生 -200 padding
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 300, 'height': 600},
+                     'layers': [{
+                         'id': 'p', 'name': 'part', 'type': 'groupLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 200, 'width': 300, 'height': 200}, 'radius': [],
+                         'layers': [
+                             # 超大误嵌背景：铺满画板，从 y=0 开始（比父大）
+                             _mastergo_shape('bg', 300, 600, left=0, top=0,
+                                             fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(0, 0, 0)}]),
+                             # 真实内容：在父内部
+                             _mastergo_shape('内容', 100, 40, left=20, top=220,
+                                             fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}]),
+                         ],
+                     }]},
+    }
+    part = parse_design_structure(sketch)['nodes'][0]
+    pad = part.get('padding')
+    if pad:
+        assert all(v >= 0 for v in pad.values())  # 无负 padding
+
+
+def test_zero_size_empty_container_dropped():
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 100},
+                     'layers': [
+                         {'id': 'z', 'name': '空组', 'type': 'groupLayer', 'visible': True,
+                          'frame': {'left': 0, 'top': 0, 'width': 0, 'height': 0}, 'radius': [], 'layers': []},
+                         _mastergo_shape('实', 20, 20, fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}]),
+                     ]},
+    }
+    names = [n['name'] for n in parse_design_structure(sketch)['nodes']]
+    assert '空组' not in names and '实' in names  # 0×0 空容器被丢弃
+
+
+def test_slice_with_fill_still_image():
+    # 导出切图即使带填充，也应识别为 image（不能被当成 shape 丢掉 imageUrl）
+    sketch = {
+        'type': 'psd', 'sliceScale': 2,
+        'board': {'name': 'b', 'width': 200, 'height': 200, 'layers': [
+            {'id': 9, 'name': '带填充切图', 'type': 'shapeLayer', 'visible': True,
+             'isSlice': True, 'hasExportDDSImage': True,
+             'left': 10, 'top': 10, 'width': 80, 'height': 80,
+             'style': {'fills': [{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 0, 0)}]},
+             'ddsImages': {'orgUrl': 'https://cdn/x'}},
+        ]},
+    }
+    n = parse_design_structure(sketch)['nodes'][0]
+    assert n['type'] == 'image' and n['imageUrl'] == 'https://cdn/x'
+
+
 def test_tokens_summary_and_include():
     sketch = {
         'meta': {'host': {'name': 'master'}, 'sliceScale': 1},

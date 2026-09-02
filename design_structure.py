@@ -478,23 +478,23 @@ def _layout_metrics(frame: dict, children: list):
 
     fx, fy, fw, fh = frame.get('x'), frame.get('y'), frame.get('width'), frame.get('height')
 
-    # 排除铺满父容器的背景层：它不是内容兄弟，会把 padding 压成 0、把 gaps 变负，污染布局推断。
-    # 仅在还剩下内容盒子时排除，避免把纯背景容器也清空。
+    # 排除铺满/超出父容器的背景层、遮罩、误嵌大图：它们不是内容兄弟，会把 padding 压成 0
+    # 或算出极端负值（如子在画板 y=0、父在 y=2160 → padding.top=-2160）。仅在还剩内容盒子时排除。
     if None not in (fx, fy, fw, fh) and fw and fh and len(boxes) >= 2:
         parent_area = fw * fh
-        content = [b for b in boxes
-                   if not ((b[2] - b[0]) * (b[3] - b[1]) >= 0.9 * parent_area
-                           and abs(b[0] - fx) <= 2 and abs(b[1] - fy) <= 2)]
+        content = [b for b in boxes if (b[2] - b[0]) * (b[3] - b[1]) < 0.95 * parent_area]
         if content:
             boxes = content
 
     padding = None
     if None not in (fx, fy, fw, fh):
+        # padding 是派生的「内容内边距」；iOS UIEdgeInsets 不支持负值，子元素溢出父框时截断为 0
+        # （真实溢出位置仍由子节点的绝对 x/y 表达）。
         padding = {
-            'left': _round_pt(min(b[0] for b in boxes) - fx, 1),
-            'top': _round_pt(min(b[1] for b in boxes) - fy, 1),
-            'right': _round_pt((fx + fw) - max(b[2] for b in boxes), 1),
-            'bottom': _round_pt((fy + fh) - max(b[3] for b in boxes), 1),
+            'left': max(0, _round_pt(min(b[0] for b in boxes) - fx, 1) or 0),
+            'top': max(0, _round_pt(min(b[1] for b in boxes) - fy, 1) or 0),
+            'right': max(0, _round_pt((fx + fw) - max(b[2] for b in boxes), 1) or 0),
+            'bottom': max(0, _round_pt((fy + fh) - max(b[3] for b in boxes), 1) or 0),
         }
 
     gaps = None
@@ -684,6 +684,17 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
 
     if not props.get('color'):
         props['color'] = _first_fill_color(layer)
+
+    # 换行符归一化：\r\n / \r（Windows/PSD/Sketch）统一成 \n，避免 iOS CoreText 排版异常。
+    text_val = props.get('text')
+    if isinstance(text_val, str) and '\r' in text_val:
+        props['text'] = text_val.replace('\r\n', '\n').replace('\r', '\n')
+
+    # 行高 < 字号 时省略：这不是有效的 iOS 行距（会削顶/重叠），多为设计端单行文本的行盒高度，
+    # 保留会误导。不虚构数值，直接不输出，交给 iOS 用字体自然行高。
+    lh, fs = props.get('lineHeight'), props.get('fontSize')
+    if isinstance(lh, (int, float)) and isinstance(fs, (int, float)) and lh < fs:
+        props.pop('lineHeight', None)
 
     return {key: value for key, value in props.items() if value not in (None, '')}
 
@@ -894,14 +905,9 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
                 node['gaps'] = gaps
             return node
 
-        # 任意可见的盒子样式都说明这是一个需要绘制的形状（含仅渐变/仅阴影等），不能丢
-        if any(node.get(key) for key in
-               ('color', 'gradient', 'border', 'radius', 'shadow', 'blur', 'backgroundImage')):
-            node['type'] = 'shape'
-            return node
-
-        # 切图内联：Sketch/Figma 的 image.imageUrl/svgUrl，或 PSD 的 images/ddsImages。
-        # 图片「填充层」的 ddsImage(单数) 是背景图，不是切图，已在 backgroundImage 处理。
+        # 叶子：优先识别导出切图（即使它同时有填充/圆角/边框），避免被当成 shape 而丢掉 imageUrl。
+        # slice_url 仅对真正的导出层(layer.image/images/ddsImages)非空；MasterGo 的图片填充(style.fills
+        # 里的 ddsImage 单数)不会命中，仍走 backgroundImage，不会误判。
         slice_url, slice_fmt = _slice_asset(layer)
         if slice_url and (not is_figma or layer.get('hasExportImage')):
             node['type'] = 'image'
@@ -909,9 +915,20 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
             node['format'] = slice_fmt
             node['category'] = _classify_slice(frame.get('width'), frame.get('height'))
             return node
+
+        # 任意可见的盒子样式都说明这是一个需要绘制的形状（含仅渐变/仅阴影等），不能丢
+        if any(node.get(key) for key in
+               ('color', 'gradient', 'border', 'radius', 'shadow', 'blur', 'backgroundImage')):
+            node['type'] = 'shape'
+            return node
+
         if layer.get('hasExportImage'):
             node['type'] = 'image'
             return node
+
+        # 无尺寸无内容的 0×0 冗余层：丢弃以减少视图树噪声（#5）
+        if frame.get('width') == 0 and frame.get('height') == 0:
+            return None
 
         if is_group:
             node['type'] = 'container'
