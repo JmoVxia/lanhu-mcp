@@ -234,4 +234,61 @@ def test_gaps_direction_and_folding():
                      }]},
     }
     row = parse_design_structure(sketch)['nodes'][0]
-    assert row['gaps'] == {'direction': 'row', 'gap': 10}
+    # 三个方块同 top(0)、同高(20) -> row + gap 10 + 交叉轴 start 对齐（高置信）
+    assert row['gaps'] == {'direction': 'row', 'gap': 10, 'align': 'start'}
+
+
+def test_cross_axis_align_center_and_none():
+    def sq(name, left, top, h=20):
+        return _mastergo_shape(name, 20, h, left=left, top=top,
+                               fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}])
+
+    # 竖直中线对齐：不同高度但中心同一水平线 -> center
+    center_row = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 40},
+                     'layers': [{
+                         'name': '行', 'type': 'groupLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 40}, 'radius': [],
+                         'layers': [sq('a', 0, 10, h=20), sq('b', 40, 5, h=30)],  # 中心都在 y=20
+                     }]},
+    }
+    row = parse_design_structure(center_row)['nodes'][0]
+    assert row['gaps']['align'] == 'center'
+
+    # 错位：既非同 top/bottom 也非同 center -> 不给 align（不猜）
+    messy = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 60},
+                     'layers': [{
+                         'name': '行', 'type': 'groupLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 60}, 'radius': [],
+                         'layers': [sq('a', 0, 0, h=20), sq('b', 40, 30, h=20)],
+                     }]},
+    }
+    row2 = parse_design_structure(messy)['nodes'][0]
+    assert 'align' not in row2['gaps']
+
+
+def test_tokens_summary_and_include():
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 100},
+                     'layers': [
+                         _mastergo_text('标题', '标题', 16, color='rgba(255,255,255,1)'),
+                         _mastergo_text('副标题', '副标题', 12, color='rgba(255,255,255,1)'),
+                         _mastergo_slice('图标', 40, 40, 'https://cdn/i.png'),
+                     ]},
+    }
+    full = parse_design_structure(sketch)
+    assert 'tokens' in full and full['tokens']['fontSizes']  # 有主题汇总
+    assert 'slices' in full and 'texts' in full
+
+    slim = parse_design_structure(sketch, include=['nodes'])
+    # include 只留结构树：去掉冗余汇总，但保留计数
+    assert 'texts' not in slim and 'slices' not in slim and 'tokens' not in slim
+    assert slim['textCount'] == 2 and slim['sliceCount'] == 1
+    assert slim['nodes']  # 结构树仍在（含内联的 text/image 节点）

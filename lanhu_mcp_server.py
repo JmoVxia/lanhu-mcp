@@ -6240,6 +6240,7 @@ async def lanhu_get_design_structure(
         design_name: Annotated[Optional[str], "设计图名称或序号。可空：此时用 URL 里的 image_id，都没有则返回设计图列表"] = None,
         max_depth: Annotated[Optional[int], "按需加载省 token：只输出到第 N 层，更深的容器标记 truncated+childCount。可空=全量"] = None,
         node_path: Annotated[Optional[str], "按需加载：只输出该 path 起始的子树（用上一次结果里的 node.path 逐分支展开）。可空=整棵树"] = None,
+        include: Annotated[Optional[list], "段级白名单，控制是否返回冗余汇总：可选 'slices'/'texts'/'tokens'（'nodes' 恒含）。可空=全含；如 ['nodes'] 只回结构树+计数以省 token"] = None,
         ctx: Context = None
 ) -> dict:
     """
@@ -6252,20 +6253,23 @@ async def lanhu_get_design_structure(
 
     每个节点枚举的属性（坐标/字号均为逻辑点 pt，颜色为干净的 rgb()/rgba()）：
       - 布局: x, y, width, height（画板绝对坐标）；container 附 padding{left,top,right,bottom}(子相对父) 与
-              gaps{direction:row|column, gap 或 gaps[]}(兄弟排列方向+间距，直接对应 UIStackView/LinearLayout)
+              gaps{direction:row|column, gap 或 gaps[], align}(兄弟排列方向+间距+交叉轴对齐，直接对应
+              UIStackView/LinearLayout；align=start/center/end 仅高置信才给)
       - 外观: color(背景/填充), gradient{type,stops,from,to,angle}, border[{thickness,color,position,style}],
               radius(数值或 {topLeft,topRight,bottomRight,bottomLeft}), shadow[{color,x,y,blur,spread,inset}],
               blur{type,radius}, opacity, rotation, blendMode, clip(clipsToBounds), backgroundImage/imageUrl
       - 文本: text, fontSize, fontFamily, fontWeight, color, align, lineHeight, letterSpacing, italic, underline, strikethrough
-      - 切图: image 节点内联 imageUrl, format(png/svg), category(icon≤64pt / bg短边≥300pt / img)；
+      - 切图: image 节点内联 imageUrl, format(png/svg), category(icon≤64pt / bg长边≥300pt / img)；
               顶层 slices[] 汇总全部切图，直接可下载，无需再调 DDS。
 
-    节点类型: container / text / shape / image。返回顶层含 slices/sliceCount 与 texts/textCount。
+    节点类型: container / text / shape / image。返回顶层含 slices/sliceCount、texts/textCount，
+    以及 tokens{colors,fonts,fontSizes}(按使用频率 top-N，便于 iOS 建 UIColor 调色板/字体表)。
 
     按需加载（省 token，可选）：
       - max_depth=N: 只输出到第 N 层，更深容器标记 truncated+childCount；先浅拉骨架，再展开。
       - node_path="A/B/C": 只输出该节点子树（path 取自上一次结果的 node.path）。
-      - 大稿自动保护：未指定上述参数时，若完整结果过大(超 MCP 输出上限)，自动只内联浅骨架并置
+      - include=['nodes',...]: 段级白名单，去掉 texts/slices/tokens 等冗余汇总(信息已在树里)以省 token；缺省全含。
+      - 大稿自动保护：未指定 max_depth/node_path 时，若完整结果过大(超 MCP 输出上限)，自动只内联浅骨架并置
         truncatedForTokens=true，完整树写入 savedTo 文件；按提示用 node_path 展开或读该文件。
 
     USE THIS WHEN: 生成 iOS/Android/Flutter 代码, 需要精确的颜色/圆角/边框/阴影/间距/字号, 切图清单, 设计结构, 图层树, DDS失败兜底
@@ -6323,7 +6327,7 @@ async def lanhu_get_design_structure(
             params.get('team_id'),
             params['project_id'],
         )
-        parsed = parse_design_structure(sketch_data, max_depth=max_depth, node_path=node_path)
+        parsed = parse_design_structure(sketch_data, max_depth=max_depth, node_path=node_path, include=include)
 
         result = {
             'status': 'success',

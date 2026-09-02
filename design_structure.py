@@ -496,8 +496,39 @@ def _layout_metrics(frame: dict, children: list):
             gaps = {'direction': direction, 'gap': values[0]}
         else:
             gaps = {'direction': direction, 'gaps': values}
+        # 交叉轴对齐（保守：全部子在容差内一致才给，宁缺毋滥以保准确）。
+        # 对应 UIStackView.alignment：row→start=top/center/end=bottom；column→start=leading/center/end=trailing。
+        # 仅在非重叠（间距均≥0，才是真正的 stack 排列）时推断，避免在重叠/绝对定位布局上误导。
+        non_overlapping = all(isinstance(v, (int, float)) and v >= 0 for v in values)
+        if non_overlapping:
+            align = _cross_axis_align(boxes, direction)
+            if align:
+                gaps['align'] = align
 
     return padding, gaps
+
+
+def _cross_axis_align(boxes, direction, tol: float = 1.5):
+    """交叉轴对齐：row 看 y(top/center/bottom)，column 看 x(leading/center/trailing)。
+    仅当所有子在容差内一致时返回 start/center/end，否则 None（不猜）。"""
+    if direction == 'row':
+        starts = [b[1] for b in boxes]
+        ends = [b[3] for b in boxes]
+    else:
+        starts = [b[0] for b in boxes]
+        ends = [b[2] for b in boxes]
+    centers = [(s + e) / 2 for s, e in zip(starts, ends)]
+
+    def uniform(vals):
+        return len(vals) >= 2 and (max(vals) - min(vals)) <= tol
+
+    if uniform(starts):
+        return 'start'
+    if uniform(ends):
+        return 'end'
+    if uniform(centers):
+        return 'center'
+    return None
 
 
 def _layer_frame(layer: dict, scale: float) -> dict:
@@ -642,6 +673,41 @@ def _collect_subtree(nodes: list):
     return texts, slices
 
 
+def _collect_tokens(nodes: list) -> Optional[dict]:
+    """主题 tokens：按使用频率汇总颜色 / 字体 / 字号，便于 iOS 建 UIColor 调色板与字体表。
+    体积小（各取 top-N），信息派生自图层树。"""
+    from collections import Counter
+    colors, families, sizes = Counter(), Counter(), Counter()
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        color = node.get('color')
+        if isinstance(color, str):
+            colors[color] += 1
+        if node.get('type') == 'text':
+            family = node.get('fontFamily')
+            if family:
+                families[family] += 1
+            size = node.get('fontSize')
+            if size is not None:
+                sizes[size] += 1
+        for child in node.get('children') or []:
+            walk(child)
+
+    for node in nodes:
+        walk(node)
+
+    out = {}
+    if colors:
+        out['colors'] = [{'value': v, 'count': c} for v, c in colors.most_common(10)]
+    if families:
+        out['fonts'] = [{'family': v, 'count': c} for v, c in families.most_common(6)]
+    if sizes:
+        out['fontSizes'] = [{'size': v, 'count': c} for v, c in sizes.most_common(8)]
+    return out or None
+
+
 def _prune_depth(nodes: list, max_depth: Optional[int], _depth: int = 1) -> list:
     """按 max_depth 截断输出树；被截断的 container 标记 truncated 与 childCount。"""
     if not max_depth or max_depth <= 0:
@@ -673,7 +739,8 @@ def _find_subtree(nodes: list, node_path: str) -> Optional[dict]:
 
 
 def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
-                           node_path: Optional[str] = None) -> dict:
+                           node_path: Optional[str] = None,
+                           include: Optional[list] = None) -> dict:
     """
     Build a compact layer tree from raw Lanhu design JSON.
 
@@ -683,6 +750,8 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     按需加载（省 token）：
       - max_depth: 只输出到指定层级，更深的 container 标记 truncated+childCount。
       - node_path: 只输出该 path 起始的子树（配合上一次结果里的 path 逐分支展开）。
+      - include: 段级白名单，控制是否返回冗余汇总。可选项 'slices'/'texts'/'tokens'
+        （'nodes' 恒含）。默认 None=全含；如 ['nodes'] 只回结构树+计数，去掉汇总省 token。
     切图内联：image 节点带 imageUrl/format/category，并在顶层 slices 汇总。
     """
     meta = sketch_data.get('meta') or {}
@@ -814,19 +883,29 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
         nodes = _prune_depth(nodes, max_depth)
         truncated_root = True
 
-    # 汇总基于最终输出树，保证 texts/slices 与 nodes 一致
+    # 汇总基于最终输出树，保证 texts/slices/tokens 与 nodes 一致
     out_texts, out_slices = _collect_subtree(nodes)
+
+    def _want(section):
+        return include is None or section in include
 
     result = {
         'sliceScale': int(slice_scale) if slice_scale == int(slice_scale) else slice_scale,
         'host': host,
         'artboard': artboard_info,
-        'textCount': len(out_texts),
-        'texts': out_texts,
-        'sliceCount': len(out_slices),
-        'slices': out_slices,
-        'nodes': nodes,
     }
+    # texts / slices 是冗余汇总（信息已内联在 nodes 树里）；用 include 可去掉以省 token，但保留计数
+    result['textCount'] = len(out_texts)
+    if _want('texts'):
+        result['texts'] = out_texts
+    result['sliceCount'] = len(out_slices)
+    if _want('slices'):
+        result['slices'] = out_slices
+    if _want('tokens'):
+        tokens = _collect_tokens(nodes)
+        if tokens:
+            result['tokens'] = tokens
+    result['nodes'] = nodes
     if node_path:
         result['nodePath'] = node_path
         if not nodes:
