@@ -562,6 +562,14 @@ def _layer_frame(layer: dict, scale: float) -> dict:
     top = frame.get('top', frame.get('y', layer.get('top', 0))) or 0
     width = frame.get('width', layer.get('width', 0)) or 0
     height = frame.get('height', layer.get('height', 0)) or 0
+    # 归一化翻转元素的负宽高：负值表示水平/垂直翻转，其原点在另一侧。
+    # 规范成标准左上角盒子（否则会输出非法负尺寸、坐标错位并污染 padding/gaps）。
+    if isinstance(width, (int, float)) and width < 0:
+        left += width
+        width = -width
+    if isinstance(height, (int, float)) and height < 0:
+        top += height
+        height = -height
     return {
         'x': _round_pt(left, scale),
         'y': _round_pt(top, scale),

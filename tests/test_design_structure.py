@@ -331,6 +331,24 @@ def test_text_vertical_align_captured():
     assert t['align'] == 'center' and t['verticalAlign'] == 'middle'
 
 
+def test_negative_frame_dimensions_normalized():
+    # 翻转元素的负宽高必须归一化为标准左上角盒子（非法负尺寸会污染布局）
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 100},
+                     'layers': [{
+                         'id': 'flip', 'name': '翻转', 'type': 'shapeLayer', 'visible': True,
+                         'frame': {'left': 50, 'top': 80, 'width': 10, 'height': -20}, 'radius': [],
+                         'style': {'fills': [{'isEnabled': True, 'type': 'color', 'color': _rgba01(0, 0, 0)}]},
+                         'layers': [],
+                     }]},
+    }
+    n = parse_design_structure(sketch)['nodes'][0]
+    assert n['width'] == 10 and n['height'] == 20  # 取绝对值
+    assert n['y'] == 60  # top 80 + (-20) 归一到 60
+
+
 def test_tokens_summary_and_include():
     sketch = {
         'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
