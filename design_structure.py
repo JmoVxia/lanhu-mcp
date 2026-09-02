@@ -688,6 +688,29 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
     return {key: value for key, value in props.items() if value not in (None, '')}
 
 
+def _slice_asset(layer: dict):
+    """解析切图导出图 URL 与格式。兼容：
+    Sketch/Figma  -> image.imageUrl / image.svgUrl
+    PSD           -> images{png_*: url} / ddsImages{orgUrl}（isSlice 层）"""
+    image = layer.get('image')
+    if isinstance(image, dict):
+        if image.get('imageUrl'):
+            return image['imageUrl'], 'png'
+        if image.get('svgUrl'):
+            return image['svgUrl'], 'svg'
+    images = layer.get('images')  # PSD 切图（多倍率），取第一个 http url
+    if isinstance(images, dict):
+        for key, value in images.items():
+            if isinstance(value, str) and value.startswith('http'):
+                return value, ('svg' if 'svg' in str(key).lower() else 'png')
+    dds = layer.get('ddsImages')  # PSD 原图
+    if isinstance(dds, dict):
+        url = dds.get('orgUrl') or dds.get('imageUrl')
+        if isinstance(url, str) and url.startswith('http'):
+            return url, 'png'
+    return None, None
+
+
 def _classify_slice(width, height) -> str:
     """切图按尺寸(逻辑 pt)分类：icon / bg / img。借鉴 starql/lanhu-mcp 的 bg/icon/img 思路，
     阈值按 iOS 逻辑点调整：长边 ≤64pt 视为图标，长边 ≥300pt(接近/超过屏宽)视为背景大图，其余为普通图片。"""
@@ -877,14 +900,13 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
             node['type'] = 'shape'
             return node
 
-        # 切图内联：真切图 = image.imageUrl/svgUrl（Figma 需 hasExportImage，
-        # 图片填充层的 ddsImage 不算切图，已在 backgroundImage 处理）
-        image = layer.get('image') or {}
-        image_url = image.get('imageUrl') or image.get('svgUrl')
-        if image_url and (not is_figma or layer.get('hasExportImage')):
+        # 切图内联：Sketch/Figma 的 image.imageUrl/svgUrl，或 PSD 的 images/ddsImages。
+        # 图片「填充层」的 ddsImage(单数) 是背景图，不是切图，已在 backgroundImage 处理。
+        slice_url, slice_fmt = _slice_asset(layer)
+        if slice_url and (not is_figma or layer.get('hasExportImage')):
             node['type'] = 'image'
-            node['imageUrl'] = image_url
-            node['format'] = 'png' if image.get('imageUrl') else 'svg'
+            node['imageUrl'] = slice_url
+            node['format'] = slice_fmt
             node['category'] = _classify_slice(frame.get('width'), frame.get('height'))
             return node
         if layer.get('hasExportImage'):

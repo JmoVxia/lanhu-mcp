@@ -349,6 +349,25 @@ def test_negative_frame_dimensions_normalized():
     assert n['y'] == 60  # top 80 + (-20) 归一到 60
 
 
+def test_psd_slice_images_captured():
+    # PSD 切图的图 URL 在 images{png_*}/ddsImages{orgUrl}，必须识别为 image 节点（不能丢）
+    sketch = {
+        'type': 'psd', 'psdName': '侧边', 'sliceScale': 2,
+        'board': {'name': '侧边', 'width': 750, 'height': 200, 'layers': [
+            {'id': 131, 'name': '客服', 'type': 'layerSection', 'visible': True,
+             'isSlice': True, 'hasExportDDSImage': True,
+             'left': 344, 'top': 1592, 'width': 52, 'height': 52,
+             'images': {'png_xxxhd': 'https://cdn/max_abc', 'base': 'iOS @2x'},
+             'ddsImages': {'orgUrl': 'https://cdn/abc', 'base': 'iOS @2x'}},
+        ]},
+    }
+    parsed = parse_design_structure(sketch)
+    assert parsed['sliceCount'] == 1
+    node = parsed['nodes'][0]
+    assert node['type'] == 'image' and node['category'] == 'icon'
+    assert node['imageUrl'] == 'https://cdn/max_abc' and node['format'] == 'png'
+
+
 def test_tokens_summary_and_include():
     sketch = {
         'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
