@@ -337,8 +337,13 @@ def _extract_gradient(layer: dict):
             if color:
                 entry['color'] = color
             position = stop.get('position', stop.get('location'))
-            if position is not None:
-                entry['position'] = round(float(position), 3) if isinstance(position, (int, float)) else position
+            if isinstance(position, (int, float)):
+                pos = float(position)
+                if pos > 1:  # 归一化到 0..1（部分来源用 0..100），对应 iOS CAGradientLayer.locations
+                    pos = pos / 100
+                entry['position'] = round(pos, 3)
+            elif position is not None:
+                entry['position'] = position
             if entry:
                 stops.append(entry)
         out = {}
@@ -468,8 +473,19 @@ def _layout_metrics(frame: dict, children: list):
     if not boxes:
         return None, None
 
-    padding = None
     fx, fy, fw, fh = frame.get('x'), frame.get('y'), frame.get('width'), frame.get('height')
+
+    # 排除铺满父容器的背景层：它不是内容兄弟，会把 padding 压成 0、把 gaps 变负，污染布局推断。
+    # 仅在还剩下内容盒子时排除，避免把纯背景容器也清空。
+    if None not in (fx, fy, fw, fh) and fw and fh and len(boxes) >= 2:
+        parent_area = fw * fh
+        content = [b for b in boxes
+                   if not ((b[2] - b[0]) * (b[3] - b[1]) >= 0.9 * parent_area
+                           and abs(b[0] - fx) <= 2 and abs(b[1] - fy) <= 2)]
+        if content:
+            boxes = content
+
+    padding = None
     if None not in (fx, fy, fw, fh):
         padding = {
             'left': _round_pt(min(b[0] for b in boxes) - fx, 1),
@@ -561,6 +577,21 @@ def _normalize_font_weight(value) -> Optional[Union[int, str]]:
     return mapped if mapped is not None else value
 
 
+_ALIGN_MAP = {0: 'left', 1: 'right', 2: 'center', 3: 'justify',
+              'left': 'left', 'right': 'right', 'center': 'center',
+              'centered': 'center', 'justify': 'justify', 'justified': 'justify'}
+
+
+def _normalize_align(value):
+    """统一文本对齐为 left/center/right/justify（对应 iOS NSTextAlignment）。
+    MasterGo 给字符串，Sketch justification 给整数码。"""
+    if value is None or value == '':
+        return None
+    if isinstance(value, (int, float)):
+        return _ALIGN_MAP.get(int(value), value)
+    return _ALIGN_MAP.get(str(value).lower(), value)
+
+
 def _extract_text_props(layer: dict, scale: float) -> dict:
     """MasterGo artboard / Figma textStyle / Sketch textInfo."""
     props = {}
@@ -574,8 +605,12 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
             props['fontSize'] = _round_pt(font.get('size'), scale)
         props['fontFamily'] = font.get('name') or font.get('postScriptName')
         props['fontWeight'] = _normalize_font_weight(font.get('fontWeight') or font.get('type'))
-        props['align'] = font.get('align')
+        props['align'] = _normalize_align(font.get('align'))
         props['color'] = _color_to_css(style.get('color'))
+        # 富文本多段样式：仅取首段，标记以便调用方知道存在逐段差异（完整分段见原始数据）
+        runs = raw_text.get('styles')
+        if isinstance(runs, list) and len(runs) > 1:
+            props['multiStyle'] = True
     elif isinstance(raw_text, str) and raw_text:
         props['text'] = raw_text
 
@@ -589,7 +624,7 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
         if text_style.get('color'):
             props['color'] = _color_to_css(text_style.get('color'))
         if text_style.get('align'):
-            props['align'] = text_style.get('align')
+            props['align'] = _normalize_align(text_style.get('align'))
 
     text_info = layer.get('textInfo') or {}
     if text_info:
@@ -602,8 +637,8 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
             props['fontWeight'] = 700
         if text_info.get('color'):
             props.setdefault('color', _color_to_css(text_info.get('color')))
-        if text_info.get('justification'):
-            props.setdefault('align', text_info.get('justification'))
+        if text_info.get('justification') is not None:
+            props.setdefault('align', _normalize_align(text_info.get('justification')))
 
     # 行高 / 字间距 / 斜体（各来源尽力取，逻辑点）
     font = {}
@@ -652,31 +687,11 @@ def _classify_slice(width, height) -> str:
     return 'img'
 
 
-def _collect_subtree(nodes: list):
-    """遍历输出树，重新汇总其中的 texts 与 slices（用于按需裁剪后的准确汇总）。"""
-    texts, slices = [], []
-
-    def walk(node):
-        if not isinstance(node, dict):
-            return
-        if node.get('type') == 'text':
-            texts.append({key: node[key] for key in node if key != 'children'})
-        elif node.get('type') == 'image' and node.get('imageUrl'):
-            slices.append({key: node[key] for key in
-                           ('name', 'path', 'imageUrl', 'format', 'category', 'width', 'height', 'x', 'y')
-                           if key in node})
-        for child in node.get('children') or []:
-            walk(child)
-
-    for node in nodes:
-        walk(node)
-    return texts, slices
-
-
-def _collect_tokens(nodes: list) -> Optional[dict]:
-    """主题 tokens：按使用频率汇总颜色 / 字体 / 字号，便于 iOS 建 UIColor 调色板与字体表。
-    体积小（各取 top-N），信息派生自图层树。"""
+def _collect_summaries(nodes: list):
+    """单次遍历输出树，汇总 texts / slices / tokens（省一次遍历）。
+    texts、slices 以 `id` 作为回指句柄；tokens 按使用频率取 top-N。"""
     from collections import Counter
+    texts, slices = [], []
     colors, families, sizes = Counter(), Counter(), Counter()
 
     def walk(node):
@@ -685,61 +700,74 @@ def _collect_tokens(nodes: list) -> Optional[dict]:
         color = node.get('color')
         if isinstance(color, str):
             colors[color] += 1
-        if node.get('type') == 'text':
+        node_type = node.get('type')
+        if node_type == 'text':
+            texts.append({key: node[key] for key in node if key != 'children'})
             family = node.get('fontFamily')
             if family:
                 families[family] += 1
             size = node.get('fontSize')
             if size is not None:
                 sizes[size] += 1
+        elif node_type == 'image' and node.get('imageUrl'):
+            slices.append({key: node[key] for key in
+                           ('id', 'name', 'imageUrl', 'format', 'category', 'width', 'height', 'x', 'y')
+                           if key in node})
         for child in node.get('children') or []:
             walk(child)
 
     for node in nodes:
         walk(node)
 
-    out = {}
+    tokens = {}
     if colors:
-        out['colors'] = [{'value': v, 'count': c} for v, c in colors.most_common(10)]
+        tokens['colors'] = [{'value': v, 'count': c} for v, c in colors.most_common(10)]
     if families:
-        out['fonts'] = [{'family': v, 'count': c} for v, c in families.most_common(6)]
+        tokens['fonts'] = [{'family': v, 'count': c} for v, c in families.most_common(6)]
     if sizes:
-        out['fontSizes'] = [{'size': v, 'count': c} for v, c in sizes.most_common(8)]
-    return out or None
+        tokens['fontSizes'] = [{'size': v, 'count': c} for v, c in sizes.most_common(8)]
+    return texts, slices, (tokens or None)
+
+
+_MAX_CHILDREN = 80  # 单个容器展示子节点上限，超出只取前 N 个 + 标记，保证超宽扁平分支也能返回（完整树在 savedTo）
 
 
 def _prune_depth(nodes: list, max_depth: Optional[int], _depth: int = 1) -> list:
-    """按 max_depth 截断输出树；被截断的 container 标记 truncated 与 childCount。"""
-    if not max_depth or max_depth <= 0:
-        return nodes
+    """按 max_depth 截断深度，并对超宽子节点列表按 _MAX_CHILDREN 截断广度。
+    被截断的 container 标记 truncated/childCount；被截断的宽列表标记 childrenTruncated/childCount。"""
     out = []
     for node in nodes:
         clone = dict(node)
         children = clone.get('children')
         if children:
-            if _depth >= max_depth:
+            if max_depth and _depth >= max_depth:
                 clone['childCount'] = len(children)
                 clone['truncated'] = True
                 clone.pop('children', None)
             else:
-                clone['children'] = _prune_depth(children, max_depth, _depth + 1)
+                shown = children
+                if len(children) > _MAX_CHILDREN:
+                    shown = children[:_MAX_CHILDREN]
+                    clone['childCount'] = len(children)
+                    clone['childrenTruncated'] = True  # 超宽：只展示前 N 个，其余见 savedTo
+                clone['children'] = _prune_depth(shown, max_depth, _depth + 1)
         out.append(clone)
     return out
 
 
-def _find_subtree(nodes: list, node_path: str) -> Optional[dict]:
-    """按 path 精确定位一个节点子树，找不到返回 None。"""
+def _find_subtree(nodes: list, node_id: str) -> Optional[dict]:
+    """按稳定 id 精确定位一个节点子树，找不到返回 None（id 唯一，无撞名歧义）。"""
     for node in nodes:
-        if node.get('path') == node_path:
+        if node.get('id') == node_id:
             return node
-        found = _find_subtree(node.get('children') or [], node_path)
+        found = _find_subtree(node.get('children') or [], node_id)
         if found:
             return found
     return None
 
 
 def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
-                           node_path: Optional[str] = None,
+                           node_id: Optional[str] = None,
                            include: Optional[list] = None) -> dict:
     """
     Build a compact layer tree from raw Lanhu design JSON.
@@ -747,9 +775,11 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     Returns logical-point frames and font sizes. Nested groups are always
     walked, including groups that also have export images.
 
+    每个节点带稳定唯一 id（原始图层 id），作为定位/回指句柄，避免撞名歧义。
     按需加载（省 token）：
-      - max_depth: 只输出到指定层级，更深的 container 标记 truncated+childCount。
-      - node_path: 只输出该 path 起始的子树（配合上一次结果里的 path 逐分支展开）。
+      - max_depth: 只输出到指定层级，更深的 container 标记 truncated+childCount；
+        单个容器子节点超 80 个时按广度截断（childrenTruncated+childCount），超宽扁平分支也能返回。
+      - node_id: 只输出该 id 起始的子树（配合上一次结果里的 node.id 逐分支展开）。
       - include: 段级白名单，控制是否返回冗余汇总。可选项 'slices'/'texts'/'tokens'
         （'nodes' 恒含）。默认 None=全含；如 ['nodes'] 只回结构树+计数，去掉汇总省 token。
     切图内联：image 节点带 imageUrl/format/category，并在顶层 slices 汇总。
@@ -763,7 +793,7 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     )
     host = (meta.get('host') or {}).get('name') if isinstance(meta.get('host'), dict) else meta.get('host')
     is_figma = host == 'figma'
-    texts = []
+    _fallback_id = [0]  # 原始图层缺 id 时的稳定兜底序号（同一输入遍历顺序一致，跨调用可复现）
 
     def _should_skip(layer: dict) -> bool:
         if not layer or not isinstance(layer, dict):
@@ -775,20 +805,27 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
         name = str(layer.get('name') or '')
         return name.startswith('__lanhu') or name.startswith('_annotation')
 
-    def _process(layer: dict, parent_path: str = "") -> Optional[dict]:
+    def _process(layer: dict) -> Optional[dict]:
         if _should_skip(layer):
             return None
 
         name = layer.get('name') or ''
-        path = f"{parent_path}/{name}" if parent_path else name
+        node_id = layer.get('id')
+        if node_id in (None, ''):
+            _fallback_id[0] += 1
+            node_id = f"n{_fallback_id[0]}"
+        else:
+            node_id = str(node_id)
         layer_type = (layer.get('type') or layer.get('layerType') or '').strip()
         frame = _layer_frame(layer, slice_scale)
         node = {
+            'id': node_id,
             'name': name,
-            'path': path,
             'type': layer_type or 'unknown',
             **frame,
         }
+        if layer.get('isMask') is True:
+            node['isMask'] = True  # 裁剪蒙版层，非绘制内容
 
         children_raw = layer.get('layers') or layer.get('children') or []
         is_group = layer_type in (
@@ -801,7 +838,6 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
         if is_text and not is_group:
             node['type'] = 'text'
             node.update(_extract_text_props(layer, slice_scale))
-            texts.append({key: node[key] for key in node if key != 'children'})
             return node
 
         # 补充：容器/形状统一提取填充色、边框、圆角、阴影、模糊、透明度、裁剪
@@ -810,7 +846,7 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
 
         children = []
         for child in children_raw:
-            parsed = _process(child, path)
+            parsed = _process(child)
             if parsed:
                 children.append(parsed)
         if children:
@@ -875,13 +911,12 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     nodes = [node for node in (_process(layer) for layer in root_layers) if node]
 
     # 汇总先在「完整树」上计算，保证即便返回浅骨架，slices/texts/tokens 仍是全量、
-    # sliceCount 不会漏报深层切图（node_path 时按该子树统计）。
+    # sliceCount 不会漏报深层切图（node_id 时按该子树统计）。
     summary_root = nodes
-    if node_path:
-        subtree = _find_subtree(nodes, node_path)
+    if node_id:
+        subtree = _find_subtree(nodes, node_id)
         summary_root = [subtree] if subtree else []
-    out_texts, out_slices = _collect_subtree(summary_root)
-    tokens_full = _collect_tokens(summary_root)
+    out_texts, out_slices, tokens_full = _collect_summaries(summary_root)
 
     # 再对展示树按需裁剪：先定位子树，再按深度截断
     truncated_root = False
@@ -890,8 +925,12 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
         nodes = _prune_depth(nodes, max_depth)
         truncated_root = True
 
+    # include 段级白名单；仅当含已识别段时才过滤，未识别值不静默丢弃汇总
+    known = {'nodes', 'texts', 'slices', 'tokens'}
+    active_include = include if (include and any(s in known for s in include)) else None
+
     def _want(section):
-        return include is None or section in include
+        return active_include is None or section in active_include
 
     result = {
         'sliceScale': int(slice_scale) if slice_scale == int(slice_scale) else slice_scale,
@@ -908,10 +947,10 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     if _want('tokens') and tokens_full:
         result['tokens'] = tokens_full
     result['nodes'] = nodes
-    if node_path:
-        result['nodePath'] = node_path
+    if node_id:
+        result['nodeId'] = node_id
         if not nodes:
-            result['note'] = f'未找到 path={node_path} 的节点'
+            result['note'] = f'未找到 id={node_id} 的节点'
     if max_depth and truncated_root:
         result['maxDepth'] = max_depth
     return result

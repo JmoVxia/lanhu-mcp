@@ -194,16 +194,16 @@ def test_slice_inline_and_category():
     assert parsed['slices'][0]['format'] == 'png'
 
 
-def test_on_demand_max_depth_and_node_path():
+def test_on_demand_max_depth_and_node_id():
     sketch = {
         'meta': {'host': {'name': 'master'}, 'sliceScale': 2},
         'artboard': {'name': 'a', 'type': 'artboard',
                      'frame': {'left': 0, 'top': 0, 'width': 750, 'height': 100},
                      'layers': [{
-                         'name': '外层', 'type': 'groupLayer', 'visible': True,
+                         'id': 'g1', 'name': '外层', 'type': 'groupLayer', 'visible': True,
                          'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 100}, 'radius': [],
                          'layers': [{
-                             'name': '内层', 'type': 'groupLayer', 'visible': True,
+                             'id': 'g2', 'name': '内层', 'type': 'groupLayer', 'visible': True,
                              'frame': {'left': 10, 'top': 10, 'width': 50, 'height': 50}, 'radius': [],
                              'layers': [_mastergo_shape('里', 20, 20, fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}])],
                          }],
@@ -211,11 +211,35 @@ def test_on_demand_max_depth_and_node_path():
     }
     shallow = parse_design_structure(sketch, max_depth=1)
     top = shallow['nodes'][0]
+    assert top.get('id') == 'g1'
     assert top.get('truncated') is True and top.get('childCount') == 1 and 'children' not in top
 
-    sub = parse_design_structure(sketch, node_path='外层/内层')
+    # 按稳定 id 定位子树（无撞名歧义）
+    sub = parse_design_structure(sketch, node_id='g2')
     assert len(sub['nodes']) == 1 and sub['nodes'][0]['name'] == '内层'
-    assert sub['nodePath'] == '外层/内层'
+    assert sub['nodeId'] == 'g2'
+
+
+def test_duplicate_names_get_unique_ids():
+    # 撞名兄弟必须各自有唯一 id，node_id 能分别定位
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 100},
+                     'layers': [
+                         {'id': 'box_a', 'name': '框', 'type': 'groupLayer', 'visible': True,
+                          'frame': {'left': 0, 'top': 0, 'width': 50, 'height': 50}, 'radius': [],
+                          'layers': [_mastergo_text('A', 'A', 12)]},
+                         {'id': 'box_b', 'name': '框', 'type': 'groupLayer', 'visible': True,
+                          'frame': {'left': 100, 'top': 0, 'width': 50, 'height': 50}, 'radius': [],
+                          'layers': [_mastergo_text('B', 'B', 12)]},
+                     ]},
+    }
+    parsed = parse_design_structure(sketch)
+    ids = [n['id'] for n in parsed['nodes']]
+    assert ids == ['box_a', 'box_b']  # 同名但 id 不同
+    b = parse_design_structure(sketch, node_id='box_b')
+    assert b['nodes'][0]['children'][0]['text'] == 'B'  # 精确定位到第二个"框"
 
 
 def test_gaps_direction_and_folding():

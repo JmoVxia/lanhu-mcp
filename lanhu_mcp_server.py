@@ -34,7 +34,7 @@ except ImportError:
 CHINA_TZ = timezone(timedelta(hours=8))
 from urllib.parse import urlparse
 from email.utils import parsedate_to_datetime
-from design_structure import parse_design_structure, _prune_depth, _find_subtree
+from design_structure import parse_design_structure, _prune_depth, _find_subtree, _collect_summaries
 
 # 元数据缓存配置（基于版本号的永久缓存）
 _metadata_cache = {}  # {cache_key: {'data': {...}, 'version_id': str}}
@@ -6239,7 +6239,7 @@ async def lanhu_get_design_structure(
         url: Annotated[str, "蓝湖 URL，含 tid 和 pid。支持 detailDetach: ?pid=xxx&image_id=xxx"],
         design_name: Annotated[Optional[str], "设计图名称或序号。可空：此时用 URL 里的 image_id，都没有则返回设计图列表"] = None,
         max_depth: Annotated[Optional[int], "按需加载省 token：只输出到第 N 层，更深的容器标记 truncated+childCount。可空=全量"] = None,
-        node_path: Annotated[Optional[str], "按需加载：只输出该 path 起始的子树（用上一次结果里的 node.path 逐分支展开）。可空=整棵树"] = None,
+        node_id: Annotated[Optional[str], "按需加载：只输出该 id 起始的子树（用上一次结果里的 node.id 逐分支展开；id 唯一，无撞名歧义）。可空=整棵树"] = None,
         include: Annotated[Optional[list], "段级白名单，控制是否返回冗余汇总：可选 'slices'/'texts'/'tokens'（'nodes' 恒含）。可空=全含；如 ['nodes'] 只回结构树+计数以省 token"] = None,
         ctx: Context = None
 ) -> dict:
@@ -6262,21 +6262,22 @@ async def lanhu_get_design_structure(
       - 切图: image 节点内联 imageUrl, format(png/svg), category(icon≤64pt / bg长边≥300pt / img)；
               顶层 slices[] 汇总全部切图，直接可下载，无需再调 DDS。
 
-    节点类型: container / text / shape / image。返回顶层含 slices/sliceCount、texts/textCount，
-    以及 tokens{colors,fonts,fontSizes}(按使用频率 top-N，便于 iOS 建 UIColor 调色板/字体表)。
+    节点类型: container / text / shape / image。每个节点带稳定唯一 id 作为定位句柄（无撞名歧义）。
+    返回顶层含 slices/sliceCount、texts/textCount，以及 tokens{colors,fonts,fontSizes}(按使用频率 top-N，
+    便于 iOS 建 UIColor 调色板/字体表)。
 
     智能渐进按需加载（默认自动，最省 token）：
       - 默认不带参数：小稿一次返回全量；中大稿自动只返回「能放进 token 预算的最大深度骨架」
         (progressive=true、truncatedForTokens=true，truncated 容器带 childCount)，再按需展开。
-      - node_path="A/B/C": 展开该节点子树（path 取自上一次结果的 node.path）——渐进的下一步。
-      - max_depth=N: 显式只输出到第 N 层。
+      - node_id="2:1038": 展开该节点子树（id 取自上一次结果的 node.id）——渐进的下一步，唯一无歧义。
+      - max_depth=N: 显式只输出到第 N 层。单容器子节点超 80 个按广度截断(childrenTruncated)，超宽扁平分支也能返回。
       - include=['nodes',...]: 段级白名单，去掉 texts/slices/tokens 等冗余汇总(信息已在树里)以省 token；缺省全含。
       - savedTo: 每次调用都把「完整树」写盘（不受本次返回粒度影响），需要整棵树时可直接读该文件。
 
     USE THIS WHEN: 生成 iOS/Android/Flutter 代码, 需要精确的颜色/圆角/边框/阴影/间距/字号, 切图清单, 设计结构, 图层树, DDS失败兜底
     DO NOT USE for: 仅需批量下载切图文件 (可用 lanhu_get_design_slices；本工具已给切图 URL)
 
-    WORKFLOW: 可先 lanhu_get_designs，再带 design_name 调用。大图先 max_depth=2 看骨架，再用 node_path 深入。
+    WORKFLOW: 可先 lanhu_get_designs，再带 design_name 调用。大图先 max_depth=2 看骨架，再用 node_id 深入。
     """
     extractor = LanhuExtractor()
     try:
@@ -6357,20 +6358,25 @@ async def lanhu_get_design_structure(
             json.dump(full_result, handle, ensure_ascii=False, indent=2)  # 存完整树（不受 include 影响）
         saved = str(json_path)
 
-        def _want(section):
-            return include is None or section in include
+        # include 段级白名单守卫：未识别值不静默丢弃汇总（与 parse 内一致）
+        known_sections = {'nodes', 'texts', 'slices', 'tokens'}
+        active_include = include if (include and any(s in known_sections for s in include)) else None
 
-        def _view(view_nodes, extra=None):
-            # 汇总取自完整树（始终完整），按 include 决定是否内联；view_nodes 为裁剪后的展示树
+        def _want(section):
+            return active_include is None or section in active_include
+
+        def _view(view_nodes, summary, extra=None):
+            # summary = (texts, slices, tokens)，按当前展示范围计算，保证计数与内容一致
+            texts, slices, tokens = summary
             d = {'sliceScale': full_parsed.get('sliceScale'), 'host': full_parsed.get('host'),
-                 'artboard': full_parsed.get('artboard'), 'textCount': full_parsed.get('textCount'),
-                 'sliceCount': full_parsed.get('sliceCount')}
-            if _want('texts') and 'texts' in full_parsed:
-                d['texts'] = full_parsed['texts']
-            if _want('slices') and 'slices' in full_parsed:
-                d['slices'] = full_parsed['slices']
-            if _want('tokens') and 'tokens' in full_parsed:
-                d['tokens'] = full_parsed['tokens']
+                 'artboard': full_parsed.get('artboard'),
+                 'textCount': len(texts), 'sliceCount': len(slices)}
+            if _want('texts'):
+                d['texts'] = texts
+            if _want('slices'):
+                d['slices'] = slices
+            if _want('tokens') and tokens:
+                d['tokens'] = tokens
             d['nodes'] = view_nodes
             return _wrap(d, {**(extra or {}), 'savedTo': saved})
 
@@ -6378,28 +6384,30 @@ async def lanhu_get_design_structure(
         CEILING = 24000   # 硬上限（约 12000 token，远低于 MCP 25000）：任何自动返回都不得超过
 
         base_nodes = full_parsed.get('nodes') or []
+        full_summary = (full_parsed.get('texts') or [], full_parsed.get('slices') or [], full_parsed.get('tokens'))
 
-        # 显式按需：定位子树 / 深度裁剪
-        if max_depth or node_path:
+        # 显式按需：按 id 定位子树 / 深度裁剪
+        if max_depth or node_id:
             nodes = base_nodes
+            summary = full_summary
             extra = {}
-            if node_path:
-                sub = _find_subtree(nodes, node_path)
+            if node_id:
+                sub = _find_subtree(nodes, node_id)
                 if not sub:
-                    return _view([], {'nodePath': node_path, 'note': f'未找到 path={node_path} 的节点'})
+                    return _view([], ([], [], None), {'nodeId': node_id, 'note': f'未找到 id={node_id} 的节点'})
                 nodes = [sub]
-                extra['nodePath'] = node_path
+                summary = _collect_summaries(nodes)  # 汇总按该子树口径，计数与返回一致
+                extra['nodeId'] = node_id
             if max_depth:
-                # 用户显式指定深度，尊重其选择
-                return _view(_prune_depth(nodes, max_depth), {**extra, 'maxDepth': max_depth})
-            # 仅 node_path：分支可能很大，套用硬上限自动裁剪，避免超 MCP 输出限（F2）
-            view = _view(nodes, extra)
+                return _view(_prune_depth(nodes, max_depth), summary, {**extra, 'maxDepth': max_depth})
+            # 仅 node_id：分支可能很大，套用硬上限自动裁剪，避免超 MCP 输出限
+            view = _view(nodes, summary, extra)
             if len(json.dumps(view, ensure_ascii=False)) <= CEILING:
                 return view
             for depth in (5, 4, 3, 2, 1):
-                capped = _view(_prune_depth(nodes, depth), {
+                capped = _view(_prune_depth(nodes, depth), summary, {
                     **extra, 'maxDepth': depth, 'truncatedForTokens': True, 'progressive': True,
-                    'hint': f'该子树较大，已裁剪到第 {depth} 层（truncated 容器带 childCount）。继续用 node_path 深入，或读 savedTo。',
+                    'hint': f'该子树较大，已裁剪到第 {depth} 层（truncated 容器带 childCount）。继续用 node_id 深入，或读 savedTo。',
                 })
                 if depth == 1 or len(json.dumps(capped, ensure_ascii=False)) <= CEILING:
                     return capped
@@ -6407,20 +6415,18 @@ async def lanhu_get_design_structure(
 
         # 智能渐进（默认）：小稿一次全量到位；中大稿返回「能放进预算的最大深度骨架」，AI 再按需展开。
         if len(json.dumps(full_result, ensure_ascii=False)) <= BUDGET:
-            full_result['savedTo'] = saved
-            return full_result
+            return _view(base_nodes, full_summary)
         for depth in (5, 4, 3, 2, 1):
-            slim = _view(_prune_depth(base_nodes, depth), {
+            slim = _view(_prune_depth(base_nodes, depth), full_summary, {
                 'truncatedForTokens': True, 'progressive': True, 'maxDepth': depth,
                 'hint': (
                     f'设计稿较大，已渐进返回第 {depth} 层骨架（truncated 容器带 childCount，省 token）。'
-                    f'完整树在 savedTo；需要某分支细节时带 node_path=该容器 path 展开，需要整棵树时读该文件。'
+                    f'完整树在 savedTo；需要某分支细节时带 node_id=该容器 id 展开，需要整棵树时读该文件。'
                 ),
             })
             if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= BUDGET:
                 return slim
-        full_result['savedTo'] = saved
-        return full_result
+        return _view(base_nodes, full_summary)
     except Exception as exc:
         return {
             'status': 'error',
