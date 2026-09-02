@@ -35,6 +35,11 @@ CHINA_TZ = timezone(timedelta(hours=8))
 from urllib.parse import urlparse
 from email.utils import parsedate_to_datetime
 from design_structure import parse_design_structure, _prune_depth, _find_subtree, _collect_summaries
+from collections import OrderedDict as _OrderedDict
+
+# 版本感知的进程内结构缓存：image_id -> (json_url, full_parsed)。json_url 随版本变化，天然做版本键。
+_STRUCTURE_CACHE = _OrderedDict()
+_STRUCTURE_CACHE_CAP = 8
 
 # 元数据缓存配置（基于版本号的永久缓存）
 _metadata_cache = {}  # {cache_key: {'data': {...}, 'version_id': str}}
@@ -3731,23 +3736,22 @@ class LanhuExtractor:
         version_id = await self._get_version_id_by_image_id(project_id, team_id, image_id)
         return await self._fetch_dds_schema(version_id)
 
-    async def get_sketch_json(self, image_id: str, team_id: str = None, project_id: str = None) -> dict:
-        """获取原始 Sketch JSON（含完整设计标注数据，用于 design token 提取）"""
+    async def get_sketch_json_url(self, image_id: str, team_id: str = None, project_id: str = None) -> str:
+        """只查最新版本的 json_url（轻量图片元信息接口，不下载大 JSON）。
+        json_url 随设计版本变化，可作为缓存/版本键。"""
         url = f"{BASE_URL}/api/project/image"
-        params = {
-            "dds_status": 1,
-            "image_id": image_id,
-            "project_id": project_id
-        }
+        params = {"dds_status": 1, "image_id": image_id, "project_id": project_id}
         if team_id:
             params["team_id"] = team_id
         response = await self.client.get(url, params=params)
         data = response.json()
         if data['code'] != '00000':
             raise Exception(f"Failed to get design: {data['msg']}")
-        result = data['result']
-        latest_version = result['versions'][0]
-        json_url = latest_version['json_url']
+        return data['result']['versions'][0]['json_url']
+
+    async def get_sketch_json(self, image_id: str, team_id: str = None, project_id: str = None) -> dict:
+        """获取原始 Sketch JSON（含完整设计标注数据，用于 design token 提取）"""
+        json_url = await self.get_sketch_json_url(image_id, team_id, project_id)
         json_response = await self.client.get(json_url)
         return json_response.json()
 
@@ -6263,8 +6267,9 @@ async def lanhu_get_design_structure(
               顶层 slices[] 汇总全部切图，直接可下载，无需再调 DDS。
 
     节点类型: container / text / shape / image。每个节点带稳定唯一 id 作为定位句柄（无撞名歧义）。
-    返回顶层含 slices/sliceCount、texts/textCount，以及 tokens{colors,fonts,fontSizes}(按使用频率 top-N，
-    便于 iOS 建 UIColor 调色板/字体表)。
+    顶层恒含 sliceCount/textCount 计数与 tokens{colors,fonts,fontSizes}(top-N，便于建 UIColor 调色板)；
+    texts/slices 明细仅在树被截断(骨架/裁剪)时才附上作为补充——完整返回时信息已在 nodes 树内，不重复省 token。
+    同一版本设计稿的重复读取/逐分支展开走进程内缓存(json_url 版本键)，跳过重复下载与解析。
 
     智能渐进按需加载（默认自动，最省 token）：
       - 默认不带参数：小稿一次返回全量；中大稿自动只返回「能放进 token 预算的最大深度骨架」
@@ -6324,12 +6329,6 @@ async def lanhu_get_design_structure(
                 ],
             }
 
-        sketch_data = await extractor.get_sketch_json(
-            target['id'],
-            params.get('team_id'),
-            params['project_id'],
-        )
-
         _usage = (
             '设计属性权威来源：坐标/尺寸/字号为逻辑点(pt)，颜色为 rgb()/rgba()。'
             '请把每个节点的属性精确叠加到代码——iOS: color→backgroundColor, radius→layer.cornerRadius(dict 用 maskedCorners), '
@@ -6347,35 +6346,47 @@ async def lanhu_get_design_structure(
                 out.update(extra)
             return out
 
-        # 完整树只解析一次：作为存盘的「完整数据」与所有返回视图的唯一来源（避免重复解析）。
-        # 汇总(slices/texts/tokens)在 parse 内已基于完整树计算，浅骨架也不会漏报深层切图。
-        full_parsed = parse_design_structure(sketch_data)
+        # 版本感知缓存：json_url 随设计版本变化。命中则跳过大 JSON 下载 + 整树解析（drill-down/重复读取提速），
+        # 版本变了自动失效（不会读到旧数据）。完整树只解析一次，作为存盘与所有视图的唯一来源。
+        json_path = DATA_DIR / 'lanhu_designs' / 'structures' / f"{target['id']}.json"
+        json_url = await extractor.get_sketch_json_url(
+            target['id'], params.get('team_id'), params['project_id'])
+        cached = _STRUCTURE_CACHE.get(target['id'])
+        if cached and cached[0] == json_url and json_path.exists():
+            full_parsed = cached[1]
+        else:
+            sketch_data = (await extractor.client.get(json_url)).json()
+            full_parsed = parse_design_structure(sketch_data)
+            _STRUCTURE_CACHE[target['id']] = (json_url, full_parsed)
+            _STRUCTURE_CACHE.move_to_end(target['id'])
+            while len(_STRUCTURE_CACHE) > _STRUCTURE_CACHE_CAP:
+                _STRUCTURE_CACHE.popitem(last=False)
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(json_path, 'w', encoding='utf-8') as handle:
+                json.dump(_wrap(full_parsed), handle, ensure_ascii=False, indent=2)  # 存完整树（不受 include 影响）
         full_result = _wrap(full_parsed)
-        output_dir = DATA_DIR / 'lanhu_designs' / 'structures'
-        output_dir.mkdir(parents=True, exist_ok=True)
-        json_path = output_dir / f"{target['id']}.json"
-        with open(json_path, 'w', encoding='utf-8') as handle:
-            json.dump(full_result, handle, ensure_ascii=False, indent=2)  # 存完整树（不受 include 影响）
         saved = str(json_path)
 
         # include 段级白名单守卫：未识别值不静默丢弃汇总（与 parse 内一致）
         known_sections = {'nodes', 'texts', 'slices', 'tokens'}
         active_include = include if (include and any(s in known_sections for s in include)) else None
 
-        def _want(section):
-            return active_include is None or section in active_include
+        def _want(section, default):
+            # active_include 为 None 时按 default（texts/slices 仅在树被截断时才附，避免与完整树重复）
+            return default if active_include is None else (section in active_include)
 
-        def _view(view_nodes, summary, extra=None):
-            # summary = (texts, slices, tokens)，按当前展示范围计算，保证计数与内容一致
+        def _view(view_nodes, summary, extra=None, truncated=False):
+            # summary = (texts, slices, tokens)，按当前展示范围计算，计数始终给出。
             texts, slices, tokens = summary
             d = {'sliceScale': full_parsed.get('sliceScale'), 'host': full_parsed.get('host'),
                  'artboard': full_parsed.get('artboard'),
                  'textCount': len(texts), 'sliceCount': len(slices)}
-            if _want('texts'):
+            # 完整返回时 texts/slices 与 nodes 树重复 → 默认省略；被截断时才附上，作为“完整补充”避免漏。
+            if _want('texts', truncated):
                 d['texts'] = texts
-            if _want('slices'):
+            if _want('slices', truncated):
                 d['slices'] = slices
-            if _want('tokens') and tokens:
+            if _want('tokens', True) and tokens:
                 d['tokens'] = tokens
             d['nodes'] = view_nodes
             return _wrap(d, {**(extra or {}), 'savedTo': saved})
@@ -6394,13 +6405,17 @@ async def lanhu_get_design_structure(
             if node_id:
                 sub = _find_subtree(nodes, node_id)
                 if not sub:
-                    return _view([], ([], [], None), {'nodeId': node_id, 'note': f'未找到 id={node_id} 的节点'})
+                    # 错误可恢复：给出可用的顶层 id，便于 Agent 立即修正而非重取整树
+                    available = [{'id': n.get('id'), 'name': n.get('name')} for n in base_nodes[:20]]
+                    return _wrap({}, {'nodeId': node_id, 'savedTo': saved,
+                                      'note': f'未找到 id={node_id} 的节点。id 取自上一次结果里的 node.id。',
+                                      'availableTopLevelIds': available})
                 nodes = [sub]
                 summary = _collect_summaries(nodes)  # 汇总按该子树口径，计数与返回一致
                 extra['nodeId'] = node_id
             if max_depth:
-                return _view(_prune_depth(nodes, max_depth), summary, {**extra, 'maxDepth': max_depth})
-            # 仅 node_id：分支可能很大，套用硬上限自动裁剪，避免超 MCP 输出限
+                return _view(_prune_depth(nodes, max_depth), summary, {**extra, 'maxDepth': max_depth}, truncated=True)
+            # 仅 node_id：完整子树；过大则套用硬上限自动裁剪，避免超 MCP 输出限
             view = _view(nodes, summary, extra)
             if len(json.dumps(view, ensure_ascii=False)) <= CEILING:
                 return view
@@ -6408,14 +6423,14 @@ async def lanhu_get_design_structure(
                 capped = _view(_prune_depth(nodes, depth), summary, {
                     **extra, 'maxDepth': depth, 'truncatedForTokens': True, 'progressive': True,
                     'hint': f'该子树较大，已裁剪到第 {depth} 层（truncated 容器带 childCount）。继续用 node_id 深入，或读 savedTo。',
-                })
+                }, truncated=True)
                 if depth == 1 or len(json.dumps(capped, ensure_ascii=False)) <= CEILING:
                     return capped
             return view
 
         # 智能渐进（默认）：小稿一次全量到位；中大稿返回「能放进预算的最大深度骨架」，AI 再按需展开。
         if len(json.dumps(full_result, ensure_ascii=False)) <= BUDGET:
-            return _view(base_nodes, full_summary)
+            return _view(base_nodes, full_summary)  # 完整树：texts/slices 不重复内联
         for depth in (5, 4, 3, 2, 1):
             slim = _view(_prune_depth(base_nodes, depth), full_summary, {
                 'truncatedForTokens': True, 'progressive': True, 'maxDepth': depth,
@@ -6423,10 +6438,10 @@ async def lanhu_get_design_structure(
                     f'设计稿较大，已渐进返回第 {depth} 层骨架（truncated 容器带 childCount，省 token）。'
                     f'完整树在 savedTo；需要某分支细节时带 node_id=该容器 id 展开，需要整棵树时读该文件。'
                 ),
-            })
+            }, truncated=True)
             if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= BUDGET:
                 return slim
-        return _view(base_nodes, full_summary)
+        return _view(base_nodes, full_summary, truncated=True)
     except Exception as exc:
         return {
             'status': 'error',

@@ -853,7 +853,7 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
             node['type'] = 'container'
             node['children'] = children
             padding, gaps = _layout_metrics(frame, children)
-            if padding is not None:
+            if padding is not None and any(padding.values()):  # 全 0 无信息量，省略省 token
                 node['padding'] = padding
             if gaps is not None:
                 node['gaps'] = gaps
