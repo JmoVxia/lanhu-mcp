@@ -6265,12 +6265,13 @@ async def lanhu_get_design_structure(
     节点类型: container / text / shape / image。返回顶层含 slices/sliceCount、texts/textCount，
     以及 tokens{colors,fonts,fontSizes}(按使用频率 top-N，便于 iOS 建 UIColor 调色板/字体表)。
 
-    按需加载（省 token，可选）：
-      - max_depth=N: 只输出到第 N 层，更深容器标记 truncated+childCount；先浅拉骨架，再展开。
-      - node_path="A/B/C": 只输出该节点子树（path 取自上一次结果的 node.path）。
+    智能渐进按需加载（默认自动，最省 token）：
+      - 默认不带参数：小稿一次返回全量；中大稿自动只返回「能放进 token 预算的最大深度骨架」
+        (progressive=true、truncatedForTokens=true，truncated 容器带 childCount)，再按需展开。
+      - node_path="A/B/C": 展开该节点子树（path 取自上一次结果的 node.path）——渐进的下一步。
+      - max_depth=N: 显式只输出到第 N 层。
       - include=['nodes',...]: 段级白名单，去掉 texts/slices/tokens 等冗余汇总(信息已在树里)以省 token；缺省全含。
-      - 大稿自动保护：未指定 max_depth/node_path 时，若完整结果过大(超 MCP 输出上限)，自动只内联浅骨架并置
-        truncatedForTokens=true，完整树写入 savedTo 文件；按提示用 node_path 展开或读该文件。
+      - savedTo: 每次调用都把「完整树」写盘（不受本次返回粒度影响），需要整棵树时可直接读该文件。
 
     USE THIS WHEN: 生成 iOS/Android/Flutter 代码, 需要精确的颜色/圆角/边框/阴影/间距/字号, 切图清单, 设计结构, 图层树, DDS失败兜底
     DO NOT USE for: 仅需批量下载切图文件 (可用 lanhu_get_design_slices；本工具已给切图 URL)
@@ -6327,62 +6328,61 @@ async def lanhu_get_design_structure(
             params.get('team_id'),
             params['project_id'],
         )
-        parsed = parse_design_structure(sketch_data, max_depth=max_depth, node_path=node_path, include=include)
 
-        result = {
-            'status': 'success',
-            'designName': target.get('name'),
-            'designId': target.get('id'),
-            'unit': 'pt',
-            'usage': (
-                '设计属性权威来源：坐标/尺寸/字号为逻辑点(pt)，颜色为 rgb()/rgba()。'
-                '请把每个节点的属性精确叠加到代码——iOS: color→backgroundColor, radius→layer.cornerRadius(dict 用 maskedCorners), '
-                'border→layer.borderWidth/borderColor, shadow→layer.shadow*, blur→UIVisualEffectView, '
-                'opacity→alpha, clip→clipsToBounds, gradient→CAGradientLayer(用 angle/from/to 定方向)。'
-                'padding 为子相对父边距，gaps{direction,gap} 为兄弟排列方向+间距(对应 UIStackView/LinearLayout)，'
-                'x/y 为画板绝对坐标，三者结合还原父子/兄弟布局。'
-            ),
-            **parsed,
-        }
+        _usage = (
+            '设计属性权威来源：坐标/尺寸/字号为逻辑点(pt)，颜色为 rgb()/rgba()。'
+            '请把每个节点的属性精确叠加到代码——iOS: color→backgroundColor, radius→layer.cornerRadius(dict 用 maskedCorners), '
+            'border→layer.borderWidth/borderColor, shadow→layer.shadow*, blur→UIVisualEffectView, '
+            'opacity→alpha, clip→clipsToBounds, gradient→CAGradientLayer(用 angle/from/to 定方向)。'
+            'padding 为子相对父边距，gaps{direction,gap,align} 为兄弟排列方向+间距+交叉轴对齐(对应 UIStackView/LinearLayout)，'
+            'x/y 为画板绝对坐标，三者结合还原父子/兄弟布局。'
+        )
 
+        def _wrap(parsed_dict, extra=None):
+            out = {'status': 'success', 'designName': target.get('name'),
+                   'designId': target.get('id'), 'unit': 'pt', 'usage': _usage}
+            out.update(parsed_dict)
+            if extra:
+                out.update(extra)
+            return out
+
+        # 完整树始终解析并存盘，保证 node_path 展开 / 读盘拿到的是完整数据（不受本次返回粒度影响）
+        full = parse_design_structure(sketch_data, include=include)
+        full_result = _wrap(full)
         output_dir = DATA_DIR / 'lanhu_designs' / 'structures'
         output_dir.mkdir(parents=True, exist_ok=True)
         json_path = output_dir / f"{target['id']}.json"
         with open(json_path, 'w', encoding='utf-8') as handle:
-            json.dump(result, handle, ensure_ascii=False, indent=2)
-        result['savedTo'] = str(json_path)
+            json.dump(full_result, handle, ensure_ascii=False, indent=2)
+        saved = str(json_path)
 
-        # 大输出保护：完整结构树已存盘。若内联结果过大（超过 MCP 客户端 tool 输出
-        # token 上限，常见 25000），自动降级为浅骨架，避免截断/失败；AI 再用 node_path
-        # 逐分支展开，或直接读取 savedTo 完整文件。仅在未显式按需拉取时触发。
-        MAX_INLINE_CHARS = 45000
-        if not max_depth and not node_path and len(json.dumps(result, ensure_ascii=False)) > MAX_INLINE_CHARS:
-            for depth in (3, 2, 1):
-                skeleton = parse_design_structure(sketch_data, max_depth=depth)
-                slim = {
-                    'status': 'success',
-                    'designName': target.get('name'),
-                    'designId': target.get('id'),
-                    'unit': 'pt',
-                    'truncatedForTokens': True,
-                    'savedTo': str(json_path),
-                    'hint': (
-                        f'设计稿较大，完整结构树已存盘（savedTo）。为规避 MCP 输出 token 上限，'
-                        f'仅内联到第 {depth} 层骨架（truncated 容器带 childCount）。'
-                        f'需要细节时：对目标容器传 node_path 展开，或直接读取 savedTo 文件。'
-                    ),
-                    'sliceScale': skeleton.get('sliceScale'),
-                    'host': skeleton.get('host'),
-                    'artboard': skeleton.get('artboard'),
-                    'sliceCount': parsed.get('sliceCount'),
-                    'slices': parsed.get('slices'),
-                    'textCount': parsed.get('textCount'),
-                    'maxDepth': depth,
-                    'nodes': skeleton.get('nodes'),
-                }
-                if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= MAX_INLINE_CHARS:
-                    return slim
-        return result
+        # 显式按需：直接返回裁剪结果（savedTo 指向完整树）
+        if max_depth or node_path:
+            parsed = parse_design_structure(sketch_data, max_depth=max_depth,
+                                            node_path=node_path, include=include)
+            return _wrap(parsed, {'savedTo': saved})
+
+        # 智能渐进（默认）：小稿一次全量到位；中大稿自动只返回「能放进 token 预算的最大深度骨架」，
+        # 完整树见 savedTo，AI 再用 node_path 逐分支展开。目标预算远低于 MCP 输出上限(约25000)，做到最省+按需。
+        PROGRESSIVE_TARGET = 16000  # 约 8000 token
+        if len(json.dumps(full_result, ensure_ascii=False)) <= PROGRESSIVE_TARGET:
+            full_result['savedTo'] = saved
+            return full_result
+        for depth in (5, 4, 3, 2, 1):
+            skeleton = parse_design_structure(sketch_data, max_depth=depth, include=include)
+            slim = _wrap(skeleton, {
+                'truncatedForTokens': True,
+                'progressive': True,
+                'savedTo': saved,
+                'hint': (
+                    f'设计稿较大，已渐进返回第 {depth} 层骨架（truncated 容器带 childCount，省 token）。'
+                    f'完整树在 savedTo。需要某分支细节时：带 node_path=该容器 path 展开；需要整棵树时读取 savedTo 文件。'
+                ),
+                'maxDepth': depth,
+            })
+            if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= PROGRESSIVE_TARGET:
+                return slim
+        return full_result
     except Exception as exc:
         return {
             'status': 'error',
