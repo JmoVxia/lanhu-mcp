@@ -20,7 +20,7 @@
 - **父子 + 兄弟布局**：嵌套 `children` 图层树；容器带 `padding`（子相对父边距）与 `gaps{direction:row|column, gap, align}`（兄弟排列方向+间距+交叉轴对齐，等间距折叠、`align` 高置信才给），直接对应 `UIStackView`/`LinearLayout`，配合绝对坐标 `x/y` 完整还原布局。
 - **切图内联**：图片节点直接带下载 `imageUrl` 与分类（`icon` / `bg` / `img`），顶层 `slices[]` 汇总，一次拿全，无需再走 DDS。
 - **主题 tokens**：顶层 `tokens{colors,fonts,fontSizes}` 按使用频率 top-N 汇总，便于 iOS 直接建 `UIColor` 调色板 / 字体表。
-- **按需加载省 token**：`max_depth` 先拉骨架，`node_path` 逐分支展开，`include` 段级裁剪冗余汇总（去 `texts/slices/tokens` 可省约 25%）；大稿**自动降级**为浅骨架 + 存盘完整树（`truncatedForTokens`），规避 MCP 输出 token 上限截断。
+- **智能渐进按需加载**：默认自动——小稿一次全量，中大稿返回浅骨架（每节点带唯一 `id`），再按 `node_id` 逐分支展开；`max_depth` 显式限层，`include` 段级裁剪冗余汇总；超宽容器按广度截断，完整树始终写盘（`savedTo`），规避 MCP 输出 token 上限截断。
 
 ## 🧰 工具一览
 
@@ -48,25 +48,38 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ```
 
-## 🔑 配置
+## 🔑 配置（蓝湖 Cookie）
 
-复制 `.env.example` 为 `.env`，至少填入蓝湖 Cookie：
+> ⚠️ **本服务不会自动登录、也不会抓取你的蓝湖账号信息。** 你需要手动提供一次自己的登录 Cookie，
+> 服务用它以你的身份调用蓝湖官方接口。Cookie 只保存在本地 `.env`（已被 `.gitignore` 忽略，不进版本库）。
 
-```bash
-cp .env.example .env
-```
+**第 1 步：从浏览器取 Cookie**
 
-```ini
-LANHU_COOKIE=你的蓝湖Cookie
-```
+1. 浏览器登录 [lanhuapp.com](https://lanhuapp.com)。
+2. 按 `F12` 打开开发者工具 → **Network（网络）** 面板 → 刷新页面。
+3. 点任意一条 `lanhuapp.com` 的请求 → **Headers** → 找到请求头里的 **`Cookie:`** → 整段复制它的值。
 
-获取 Cookie 的详细步骤见 [GET-COOKIE-TUTORIAL.md](GET-COOKIE-TUTORIAL.md)。其余可选项（`DATA_DIR` / `LOG_LEVEL` / `HTTP_TIMEOUT` 等）见 `.env.example`。
+（图文详版见 [GET-COOKIE-TUTORIAL.md](GET-COOKIE-TUTORIAL.md)。Cookie 会过期，失效后按同样方法更新即可。）
 
-> `.env`、`data/`、`logs/` 已被 `.gitignore` 忽略，Cookie 等私密信息不会进入版本库。
+**第 2 步：填入 Cookie（二选一）**
+
+- 方式 A（推荐）：项目根目录 `.env` 文件
+
+  ```bash
+  cp .env.example .env
+  ```
+  ```ini
+  LANHU_COOKIE=粘贴你复制的整段Cookie
+  ```
+
+- 方式 B：直接写在 MCP 客户端配置的 `env` 里（见下一节）。
+
+其余可选项（`DATA_DIR` / `LOG_LEVEL` / `HTTP_TIMEOUT` 等）见 `.env.example`。
 
 ## 🔌 接入 MCP 客户端
 
-以 stdio 方式接入（Claude Code / Cursor 等）：
+以 stdio 方式接入（Claude Code / Cursor 等）。`run-stdio.sh` 会自动加载同目录的 `.env`，
+所以 Cookie 放在 `.env` 时这里无需再写；也可直接写在 `env` 里（方式 B）：
 
 ```json
 {
@@ -75,6 +88,7 @@ LANHU_COOKIE=你的蓝湖Cookie
       "command": "/bin/bash",
       "args": ["/绝对路径/lanhu-mcp/run-stdio.sh"],
       "env": {
+        "LANHU_COOKIE": "（可选）若未写入 .env，则在此粘贴整段 Cookie",
         "LANHU_USER_NAME": "yourname",
         "LANHU_USER_ROLE": "Developer"
       }
@@ -83,25 +97,27 @@ LANHU_COOKIE=你的蓝湖Cookie
 }
 ```
 
+> 若既没在 `.env`、也没在 `env` 里配置 `LANHU_COOKIE`，所有蓝湖请求都会失败（返回未登录/获取失败）。
+
 ## 💡 使用示例
 
-直接把蓝湖设计链接交给 AI，让它调用 `lanhu_get_design_structure`：
+直接把蓝湖设计链接交给 AI，让它调用 `lanhu_get_design_structure`（默认就会智能渐进，最省 token）：
 
 ```
 用 lanhu_get_design_structure 解析这个设计稿，按返回的属性生成 iOS 代码：
 https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=xxx
 ```
 
-大图先看骨架，再深入某个分支（省 token）：
+大图会自动只返回骨架（每个节点带唯一 `id`），再按 `id` 深入某个分支（省 token）：
 
 ```
-先 max_depth=2 看整体结构；
-再对某个容器传 node_path="外层容器/内层" 展开细节。
+默认调用 → 得到浅骨架（truncated 容器带 childCount）；
+再对某个容器传 node_id="上一步结果里的 node.id" 展开细节。
 ```
 
 ## 🎯 design_structure 返回的属性
 
-坐标 / 尺寸 / 字号均为逻辑点 `pt`，颜色为干净的 `rgb()/rgba()`。
+坐标 / 尺寸 / 字号均为逻辑点 `pt`，颜色为干净的 `rgb()/rgba()`。每个节点带稳定唯一 `id`（定位句柄）、`name`、`type`（container/text/shape/image）。
 
 - **布局**：`x, y, width, height`（画板绝对坐标）；容器附 `padding{left,top,right,bottom}`（子相对父）与 `gaps{direction:row|column, gap 或 gaps[], align}`（兄弟排列方向+间距+交叉轴对齐）
 - **主题**：顶层 `tokens{colors,fonts,fontSizes}`（按使用频率 top-N）
