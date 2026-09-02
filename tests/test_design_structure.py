@@ -292,3 +292,33 @@ def test_tokens_summary_and_include():
     assert 'texts' not in slim and 'slices' not in slim and 'tokens' not in slim
     assert slim['textCount'] == 2 and slim['sliceCount'] == 1
     assert slim['nodes']  # 结构树仍在（含内联的 text/image 节点）
+
+
+def test_skeleton_summaries_are_complete():
+    # 深层切图 + 文本，浅骨架(max_depth=1)必须仍报全量 sliceCount/textCount，不漏报深层
+    deep = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 100},
+                     'layers': [{
+                         'name': 'L1', 'type': 'groupLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 100}, 'radius': [],
+                         'layers': [{
+                             'name': 'L2', 'type': 'groupLayer', 'visible': True,
+                             'frame': {'left': 0, 'top': 0, 'width': 60, 'height': 60}, 'radius': [],
+                             'layers': [
+                                 _mastergo_slice('icon', 40, 40, 'https://cdn/i.png'),
+                                 _mastergo_text('深层文字', '深层文字', 12),
+                             ],
+                         }],
+                     }]},
+    }
+    full = parse_design_structure(deep)
+    d1 = parse_design_structure(deep, max_depth=1)
+    assert full['sliceCount'] == 1 and full['textCount'] == 1
+    # 骨架汇总来自完整树，计数与切图清单必须与全量一致（F1 回归）
+    assert d1['sliceCount'] == full['sliceCount']
+    assert d1['textCount'] == full['textCount']
+    assert d1['slices'] == full['slices']
+    # 但展示树是浅的（顶层被截断）
+    assert d1['nodes'][0].get('truncated') is True

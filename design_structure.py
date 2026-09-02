@@ -874,17 +874,21 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
 
     nodes = [node for node in (_process(layer) for layer in root_layers) if node]
 
-    # 按需裁剪：先定位子树，再按深度截断
-    truncated_root = False
+    # 汇总先在「完整树」上计算，保证即便返回浅骨架，slices/texts/tokens 仍是全量、
+    # sliceCount 不会漏报深层切图（node_path 时按该子树统计）。
+    summary_root = nodes
     if node_path:
         subtree = _find_subtree(nodes, node_path)
-        nodes = [subtree] if subtree else []
+        summary_root = [subtree] if subtree else []
+    out_texts, out_slices = _collect_subtree(summary_root)
+    tokens_full = _collect_tokens(summary_root)
+
+    # 再对展示树按需裁剪：先定位子树，再按深度截断
+    truncated_root = False
+    nodes = summary_root
     if max_depth:
         nodes = _prune_depth(nodes, max_depth)
         truncated_root = True
-
-    # 汇总基于最终输出树，保证 texts/slices/tokens 与 nodes 一致
-    out_texts, out_slices = _collect_subtree(nodes)
 
     def _want(section):
         return include is None or section in include
@@ -901,10 +905,8 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     result['sliceCount'] = len(out_slices)
     if _want('slices'):
         result['slices'] = out_slices
-    if _want('tokens'):
-        tokens = _collect_tokens(nodes)
-        if tokens:
-            result['tokens'] = tokens
+    if _want('tokens') and tokens_full:
+        result['tokens'] = tokens_full
     result['nodes'] = nodes
     if node_path:
         result['nodePath'] = node_path

@@ -34,7 +34,7 @@ except ImportError:
 CHINA_TZ = timezone(timedelta(hours=8))
 from urllib.parse import urlparse
 from email.utils import parsedate_to_datetime
-from design_structure import parse_design_structure
+from design_structure import parse_design_structure, _prune_depth, _find_subtree
 
 # 元数据缓存配置（基于版本号的永久缓存）
 _metadata_cache = {}  # {cache_key: {'data': {...}, 'version_id': str}}
@@ -6346,42 +6346,80 @@ async def lanhu_get_design_structure(
                 out.update(extra)
             return out
 
-        # 完整树始终解析并存盘，保证 node_path 展开 / 读盘拿到的是完整数据（不受本次返回粒度影响）
-        full = parse_design_structure(sketch_data, include=include)
-        full_result = _wrap(full)
+        # 完整树只解析一次：作为存盘的「完整数据」与所有返回视图的唯一来源（避免重复解析）。
+        # 汇总(slices/texts/tokens)在 parse 内已基于完整树计算，浅骨架也不会漏报深层切图。
+        full_parsed = parse_design_structure(sketch_data)
+        full_result = _wrap(full_parsed)
         output_dir = DATA_DIR / 'lanhu_designs' / 'structures'
         output_dir.mkdir(parents=True, exist_ok=True)
         json_path = output_dir / f"{target['id']}.json"
         with open(json_path, 'w', encoding='utf-8') as handle:
-            json.dump(full_result, handle, ensure_ascii=False, indent=2)
+            json.dump(full_result, handle, ensure_ascii=False, indent=2)  # 存完整树（不受 include 影响）
         saved = str(json_path)
 
-        # 显式按需：直接返回裁剪结果（savedTo 指向完整树）
-        if max_depth or node_path:
-            parsed = parse_design_structure(sketch_data, max_depth=max_depth,
-                                            node_path=node_path, include=include)
-            return _wrap(parsed, {'savedTo': saved})
+        def _want(section):
+            return include is None or section in include
 
-        # 智能渐进（默认）：小稿一次全量到位；中大稿自动只返回「能放进 token 预算的最大深度骨架」，
-        # 完整树见 savedTo，AI 再用 node_path 逐分支展开。目标预算远低于 MCP 输出上限(约25000)，做到最省+按需。
-        PROGRESSIVE_TARGET = 16000  # 约 8000 token
-        if len(json.dumps(full_result, ensure_ascii=False)) <= PROGRESSIVE_TARGET:
+        def _view(view_nodes, extra=None):
+            # 汇总取自完整树（始终完整），按 include 决定是否内联；view_nodes 为裁剪后的展示树
+            d = {'sliceScale': full_parsed.get('sliceScale'), 'host': full_parsed.get('host'),
+                 'artboard': full_parsed.get('artboard'), 'textCount': full_parsed.get('textCount'),
+                 'sliceCount': full_parsed.get('sliceCount')}
+            if _want('texts') and 'texts' in full_parsed:
+                d['texts'] = full_parsed['texts']
+            if _want('slices') and 'slices' in full_parsed:
+                d['slices'] = full_parsed['slices']
+            if _want('tokens') and 'tokens' in full_parsed:
+                d['tokens'] = full_parsed['tokens']
+            d['nodes'] = view_nodes
+            return _wrap(d, {**(extra or {}), 'savedTo': saved})
+
+        BUDGET = 16000    # 默认渐进预算（约 8000 token）
+        CEILING = 24000   # 硬上限（约 12000 token，远低于 MCP 25000）：任何自动返回都不得超过
+
+        base_nodes = full_parsed.get('nodes') or []
+
+        # 显式按需：定位子树 / 深度裁剪
+        if max_depth or node_path:
+            nodes = base_nodes
+            extra = {}
+            if node_path:
+                sub = _find_subtree(nodes, node_path)
+                if not sub:
+                    return _view([], {'nodePath': node_path, 'note': f'未找到 path={node_path} 的节点'})
+                nodes = [sub]
+                extra['nodePath'] = node_path
+            if max_depth:
+                # 用户显式指定深度，尊重其选择
+                return _view(_prune_depth(nodes, max_depth), {**extra, 'maxDepth': max_depth})
+            # 仅 node_path：分支可能很大，套用硬上限自动裁剪，避免超 MCP 输出限（F2）
+            view = _view(nodes, extra)
+            if len(json.dumps(view, ensure_ascii=False)) <= CEILING:
+                return view
+            for depth in (5, 4, 3, 2, 1):
+                capped = _view(_prune_depth(nodes, depth), {
+                    **extra, 'maxDepth': depth, 'truncatedForTokens': True, 'progressive': True,
+                    'hint': f'该子树较大，已裁剪到第 {depth} 层（truncated 容器带 childCount）。继续用 node_path 深入，或读 savedTo。',
+                })
+                if depth == 1 or len(json.dumps(capped, ensure_ascii=False)) <= CEILING:
+                    return capped
+            return view
+
+        # 智能渐进（默认）：小稿一次全量到位；中大稿返回「能放进预算的最大深度骨架」，AI 再按需展开。
+        if len(json.dumps(full_result, ensure_ascii=False)) <= BUDGET:
             full_result['savedTo'] = saved
             return full_result
         for depth in (5, 4, 3, 2, 1):
-            skeleton = parse_design_structure(sketch_data, max_depth=depth, include=include)
-            slim = _wrap(skeleton, {
-                'truncatedForTokens': True,
-                'progressive': True,
-                'savedTo': saved,
+            slim = _view(_prune_depth(base_nodes, depth), {
+                'truncatedForTokens': True, 'progressive': True, 'maxDepth': depth,
                 'hint': (
                     f'设计稿较大，已渐进返回第 {depth} 层骨架（truncated 容器带 childCount，省 token）。'
-                    f'完整树在 savedTo。需要某分支细节时：带 node_path=该容器 path 展开；需要整棵树时读取 savedTo 文件。'
+                    f'完整树在 savedTo；需要某分支细节时带 node_path=该容器 path 展开，需要整棵树时读该文件。'
                 ),
-                'maxDepth': depth,
             })
-            if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= PROGRESSIVE_TARGET:
+            if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= BUDGET:
                 return slim
+        full_result['savedTo'] = saved
         return full_result
     except Exception as exc:
         return {
