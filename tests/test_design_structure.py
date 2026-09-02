@@ -296,6 +296,41 @@ def test_cross_axis_align_center_and_none():
     assert 'align' not in row2['gaps']
 
 
+def test_overlapping_siblings_omit_gaps():
+    # 重叠（负间距）不是顺序 stack，应省略 gaps，交给绝对坐标，避免误导
+    def sq(name, left):
+        return _mastergo_shape(name, 60, 20, left=left, top=0,
+                               fills=[{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}])
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 40},
+                     'layers': [{
+                         'id': 'r', 'name': '重叠行', 'type': 'groupLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 20}, 'radius': [],
+                         'layers': [sq('a', 0), sq('b', 30)],  # 0..60 与 30..90 重叠
+                     }]},
+    }
+    row = parse_design_structure(sketch)['nodes'][0]
+    assert 'gaps' not in row  # 重叠 → 不产出误导性 gaps
+
+
+def test_text_vertical_align_captured():
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 40},
+                     'layers': [{
+                         'name': '标题', 'type': 'textLayer', 'visible': True,
+                         'frame': {'left': 0, 'top': 0, 'width': 80, 'height': 24},
+                         'text': {'style': {'content': '标题', 'font': {
+                             'name': 'PingFang', 'size': 14, 'align': 'center', 'verticalAlignment': 'middle'}}},
+                     }]},
+    }
+    t = parse_design_structure(sketch)['texts'][0]
+    assert t['align'] == 'center' and t['verticalAlign'] == 'middle'
+
+
 def test_tokens_summary_and_include():
     sketch = {
         'meta': {'host': {'name': 'master'}, 'sliceScale': 1},

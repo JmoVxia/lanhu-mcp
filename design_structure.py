@@ -453,6 +453,9 @@ def _extract_box_style(layer: dict, scale: float, frame: Optional[dict] = None) 
         if fill.get('fillType') == 2 or fill.get('type') in ('image', 'Image') or image_url:
             if isinstance(image_url, str) and image_url:
                 out['backgroundImage'] = image_url
+                mode = fill.get('scaleMode') or (image.get('scaleMode') if isinstance(image, dict) else None)
+                if isinstance(mode, str) and mode:
+                    out['backgroundImageMode'] = mode  # fill/fit/tile/stretch → iOS contentMode
             break
 
     return out
@@ -506,17 +509,16 @@ def _layout_metrics(frame: dict, children: list):
             ordered = sorted(boxes, key=lambda b: b[1])
             values = [_round_pt(ordered[i][1] - ordered[i - 1][3], 1) for i in range(1, len(ordered))]
             direction = 'column'
-        # 语义化 + 折叠：row/column 对应 iOS UIStackView / Android LinearLayout；
-        # 等间距压成单个 gap（省 token），不等则保留 gaps 数组。
-        if values and len(set(values)) == 1:
-            gaps = {'direction': direction, 'gap': values[0]}
-        else:
-            gaps = {'direction': direction, 'gaps': values}
-        # 交叉轴对齐（保守：全部子在容差内一致才给，宁缺毋滥以保准确）。
-        # 对应 UIStackView.alignment：row→start=top/center/end=bottom；column→start=leading/center/end=trailing。
-        # 仅在非重叠（间距均≥0，才是真正的 stack 排列）时推断，避免在重叠/绝对定位布局上误导。
+        # 仅在非重叠（间距均 ≥0，才是真正的顺序 stack 排列）时才产出 gaps；
+        # 重叠/绝对定位不是 stack，输出负 gap 会误导 UIStackView/LinearLayout，此时省略、交给绝对坐标。
         non_overlapping = all(isinstance(v, (int, float)) and v >= 0 for v in values)
         if non_overlapping:
+            # 语义化 + 折叠：row/column 对应 iOS UIStackView / Android LinearLayout；等间距压成单个 gap。
+            if len(set(values)) == 1:
+                gaps = {'direction': direction, 'gap': values[0]}
+            else:
+                gaps = {'direction': direction, 'gaps': values}
+            # 交叉轴对齐（保守：全部子容差内一致才给）。row→start=top/center/end=bottom；column→leading/center/trailing。
             align = _cross_axis_align(boxes, direction)
             if align:
                 gaps['align'] = align
@@ -606,6 +608,8 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
         props['fontFamily'] = font.get('name') or font.get('postScriptName')
         props['fontWeight'] = _normalize_font_weight(font.get('fontWeight') or font.get('type'))
         props['align'] = _normalize_align(font.get('align'))
+        if font.get('verticalAlignment') not in (None, ''):
+            props['verticalAlign'] = font.get('verticalAlignment')  # top/middle/bottom，iOS 竖直对齐
         props['color'] = _color_to_css(style.get('color'))
         # 富文本多段样式：仅取首段，标记以便调用方知道存在逐段差异（完整分段见原始数据）
         runs = raw_text.get('styles')

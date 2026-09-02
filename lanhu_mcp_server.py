@@ -34,7 +34,8 @@ except ImportError:
 CHINA_TZ = timezone(timedelta(hours=8))
 from urllib.parse import urlparse
 from email.utils import parsedate_to_datetime
-from design_structure import parse_design_structure, _prune_depth, _find_subtree, _collect_summaries
+from design_structure import (parse_design_structure, _prune_depth, _find_subtree,
+                               _collect_summaries, _MAX_CHILDREN)
 from collections import OrderedDict as _OrderedDict
 
 # 版本感知的进程内结构缓存：image_id -> (json_url, full_parsed)。json_url 随版本变化，天然做版本键。
@@ -6245,6 +6246,7 @@ async def lanhu_get_design_structure(
         max_depth: Annotated[Optional[int], "按需加载省 token：只输出到第 N 层，更深的容器标记 truncated+childCount。可空=全量"] = None,
         node_id: Annotated[Optional[str], "按需加载：只输出该 id 起始的子树（用上一次结果里的 node.id 逐分支展开；id 唯一，无撞名歧义）。可空=整棵树"] = None,
         include: Annotated[Optional[list], "段级白名单，控制是否返回冗余汇总：可选 'slices'/'texts'/'tokens'（'nodes' 恒含）。可空=全含；如 ['nodes'] 只回结构树+计数以省 token"] = None,
+        child_offset: Annotated[int, "配合 node_id 分页超宽列表：从第 child_offset 个直接子节点开始返回一窗（结果里 nextChildOffset 给出下一页起点）。默认 0"] = 0,
         ctx: Context = None
 ) -> dict:
     """
@@ -6275,7 +6277,10 @@ async def lanhu_get_design_structure(
       - 默认不带参数：小稿一次返回全量；中大稿自动只返回「能放进 token 预算的最大深度骨架」
         (progressive=true、truncatedForTokens=true，truncated 容器带 childCount)，再按需展开。
       - node_id="2:1038": 展开该节点子树（id 取自上一次结果的 node.id）——渐进的下一步，唯一无歧义。
-      - max_depth=N: 显式只输出到第 N 层。单容器子节点超 80 个按广度截断(childrenTruncated)，超宽扁平分支也能返回。
+      - max_depth=N: 显式只输出到第 N 层。单容器子节点超 80 个按广度截断(childrenTruncated)。
+      - child_offset=N: 配合 node_id 翻页超宽列表（>80 直接子节点）；结果里 nextChildOffset 给出下一页起点，
+        据此可把几百项的长列表逐页完整取回，不会因 MCP 限制而丢项。
+      找不到 node_id 时返回 status='not_found' + availableTopLevelIds，便于直接改正。
       - include=['nodes',...]: 段级白名单，去掉 texts/slices/tokens 等冗余汇总(信息已在树里)以省 token；缺省全含。
       - savedTo: 每次调用都把「完整树」写盘（不受本次返回粒度影响），需要整棵树时可直接读该文件。
 
@@ -6364,7 +6369,6 @@ async def lanhu_get_design_structure(
             json_path.parent.mkdir(parents=True, exist_ok=True)
             with open(json_path, 'w', encoding='utf-8') as handle:
                 json.dump(_wrap(full_parsed), handle, ensure_ascii=False, indent=2)  # 存完整树（不受 include 影响）
-        full_result = _wrap(full_parsed)
         saved = str(json_path)
 
         # include 段级白名单守卫：未识别值不静默丢弃汇总（与 parse 内一致）
@@ -6374,6 +6378,9 @@ async def lanhu_get_design_structure(
         def _want(section, default):
             # active_include 为 None 时按 default（texts/slices 仅在树被截断时才附，避免与完整树重复）
             return default if active_include is None else (section in active_include)
+
+        def _size(obj):
+            return len(json.dumps(obj, ensure_ascii=False))
 
         def _view(view_nodes, summary, extra=None, truncated=False):
             # summary = (texts, slices, tokens)，按当前展示范围计算，计数始终给出。
@@ -6391,13 +6398,46 @@ async def lanhu_get_design_structure(
             d['nodes'] = view_nodes
             return _wrap(d, {**(extra or {}), 'savedTo': saved})
 
+        def _render_within(nodes, summary, budget, base_extra=None):
+            """先尝试完整返回；放不下再按「能放进预算的最大深度」渐进裁剪。统一渐进逻辑，避免重复。"""
+            base_extra = base_extra or {}
+            full_view = _view(nodes, summary, base_extra, truncated=False)
+            if _size(full_view) <= budget:
+                return full_view
+            for depth in (5, 4, 3, 2, 1):
+                slim = _view(_prune_depth(nodes, depth), summary, {
+                    **base_extra, 'maxDepth': depth, 'truncatedForTokens': True, 'progressive': True,
+                    'hint': (f'内容较大，已渐进返回第 {depth} 层骨架（truncated 容器带 childCount，省 token）。'
+                             f'用 node_id=某容器 id 展开细节；超宽列表用 child_offset 翻页；完整树见 savedTo。'),
+                }, truncated=True)
+                if depth == 1 or _size(slim) <= budget:
+                    return slim
+            return full_view
+
+        def _window(node, offset, limit):
+            """对某节点的直接子节点分页（超宽列表）：返回一窗 + nextChildOffset 便于翻页。"""
+            children = node.get('children')
+            if not isinstance(children, list):
+                return node
+            total = len(children)
+            if offset <= 0 and total <= limit:
+                return node
+            clone = dict(node)
+            clone['children'] = children[offset:offset + limit]
+            clone['childCount'] = total
+            clone['childrenOffset'] = offset
+            if offset + limit < total:
+                clone['childrenTruncated'] = True
+                clone['nextChildOffset'] = offset + limit
+            return clone
+
         BUDGET = 16000    # 默认渐进预算（约 8000 token）
         CEILING = 24000   # 硬上限（约 12000 token，远低于 MCP 25000）：任何自动返回都不得超过
 
         base_nodes = full_parsed.get('nodes') or []
         full_summary = (full_parsed.get('texts') or [], full_parsed.get('slices') or [], full_parsed.get('tokens'))
 
-        # 显式按需：按 id 定位子树 / 深度裁剪
+        # 显式按需：按 id 定位子树 / 深度裁剪 / 超宽分页
         if max_depth or node_id:
             nodes = base_nodes
             summary = full_summary
@@ -6405,43 +6445,23 @@ async def lanhu_get_design_structure(
             if node_id:
                 sub = _find_subtree(nodes, node_id)
                 if not sub:
-                    # 错误可恢复：给出可用的顶层 id，便于 Agent 立即修正而非重取整树
+                    # 错误可恢复：明确 not_found 状态 + 可用顶层 id，便于 Agent 立即修正而非重取整树
                     available = [{'id': n.get('id'), 'name': n.get('name')} for n in base_nodes[:20]]
-                    return _wrap({}, {'nodeId': node_id, 'savedTo': saved,
-                                      'note': f'未找到 id={node_id} 的节点。id 取自上一次结果里的 node.id。',
-                                      'availableTopLevelIds': available})
+                    return {'status': 'not_found', 'designName': target.get('name'),
+                            'designId': target.get('id'), 'nodeId': node_id, 'savedTo': saved,
+                            'note': f'未找到 id={node_id} 的节点。id 取自上一次结果里的 node.id。',
+                            'availableTopLevelIds': available}
+                sub = _window(sub, max(child_offset, 0), _MAX_CHILDREN)  # 超宽列表分页
                 nodes = [sub]
                 summary = _collect_summaries(nodes)  # 汇总按该子树口径，计数与返回一致
                 extra['nodeId'] = node_id
-            if max_depth:
+            if max_depth:  # 用户显式指定深度，尊重其选择
                 return _view(_prune_depth(nodes, max_depth), summary, {**extra, 'maxDepth': max_depth}, truncated=True)
-            # 仅 node_id：完整子树；过大则套用硬上限自动裁剪，避免超 MCP 输出限
-            view = _view(nodes, summary, extra)
-            if len(json.dumps(view, ensure_ascii=False)) <= CEILING:
-                return view
-            for depth in (5, 4, 3, 2, 1):
-                capped = _view(_prune_depth(nodes, depth), summary, {
-                    **extra, 'maxDepth': depth, 'truncatedForTokens': True, 'progressive': True,
-                    'hint': f'该子树较大，已裁剪到第 {depth} 层（truncated 容器带 childCount）。继续用 node_id 深入，或读 savedTo。',
-                }, truncated=True)
-                if depth == 1 or len(json.dumps(capped, ensure_ascii=False)) <= CEILING:
-                    return capped
-            return view
+            # 仅 node_id：完整子树，过大则在硬上限内自动裁剪
+            return _render_within(nodes, summary, CEILING, extra)
 
-        # 智能渐进（默认）：小稿一次全量到位；中大稿返回「能放进预算的最大深度骨架」，AI 再按需展开。
-        if len(json.dumps(full_result, ensure_ascii=False)) <= BUDGET:
-            return _view(base_nodes, full_summary)  # 完整树：texts/slices 不重复内联
-        for depth in (5, 4, 3, 2, 1):
-            slim = _view(_prune_depth(base_nodes, depth), full_summary, {
-                'truncatedForTokens': True, 'progressive': True, 'maxDepth': depth,
-                'hint': (
-                    f'设计稿较大，已渐进返回第 {depth} 层骨架（truncated 容器带 childCount，省 token）。'
-                    f'完整树在 savedTo；需要某分支细节时带 node_id=该容器 id 展开，需要整棵树时读该文件。'
-                ),
-            }, truncated=True)
-            if depth == 1 or len(json.dumps(slim, ensure_ascii=False)) <= BUDGET:
-                return slim
-        return _view(base_nodes, full_summary, truncated=True)
+        # 智能渐进（默认）：按「实际返回体」是否放得进预算决定——小稿一次全量，中大稿渐进骨架。
+        return _render_within(base_nodes, full_summary, BUDGET)
     except Exception as exc:
         return {
             'status': 'error',
