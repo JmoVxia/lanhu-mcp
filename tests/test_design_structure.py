@@ -441,6 +441,28 @@ def test_slice_with_fill_still_image():
     assert n['type'] == 'image' and n['imageUrl'] == 'https://cdn/x'
 
 
+def test_figma_dict_radius_zero_omitted_and_uniform_collapsed():
+    def fig(name, radius):
+        return {'id': name, 'name': name, 'type': 'shapeLayer', 'visible': True,
+                'frame': {'left': 0, 'top': 0, 'width': 100, 'height': 40},
+                'style': {'fills': [{'isEnabled': True, 'type': 'color', 'color': _rgba01(1, 1, 1)}]},
+                'radius': radius, 'layers': []}
+    sketch = {
+        'meta': {'host': {'name': 'figma'}, 'sliceScale': 1},
+        'artboard': {'name': 'a', 'type': 'artboard',
+                     'frame': {'left': 0, 'top': 0, 'width': 200, 'height': 200},
+                     'layers': [
+                         fig('zero', {'topLeft': 0, 'topRight': 0, 'bottomRight': 0, 'bottomLeft': 0}),
+                         fig('uniform', {'topLeft': 8, 'topRight': 8, 'bottomRight': 8, 'bottomLeft': 8}),
+                         fig('mixed', {'topLeft': 8, 'topRight': 8, 'bottomRight': 0, 'bottomLeft': 0}),
+                     ]},
+    }
+    nodes = {n['name']: n for n in parse_design_structure(sketch)['nodes']}
+    assert 'radius' not in nodes['zero']            # 全 0 逐角圆角省略
+    assert nodes['uniform']['radius'] == 8          # 相等折叠为单值
+    assert nodes['mixed']['radius'] == {'topLeft': 8, 'topRight': 8, 'bottomRight': 0, 'bottomLeft': 0}
+
+
 def test_tokens_summary_and_include():
     sketch = {
         'meta': {'host': {'name': 'master'}, 'sliceScale': 1},

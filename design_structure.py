@@ -212,13 +212,19 @@ def _extract_radius(layer: dict, scale: float, max_radius: Optional[float] = Non
             radius = layer.get('cornerRadius')
         if radius in (None, 0, [], {}):
             return None
-        if isinstance(radius, (int, float)):
+        if isinstance(radius, dict):  # Figma 逐角圆角字典 {topLeft,topRight,bottomRight,bottomLeft}
+            raw = [radius.get('topLeft'), radius.get('topRight'),
+                   radius.get('bottomRight'), radius.get('bottomLeft')]
+            if not any(isinstance(item, (int, float)) and item for item in raw):
+                return None  # 全 0 逐角圆角是噪声，省略
+            values = [_round_pt(item or 0, scale) for item in raw]
+        elif isinstance(radius, (int, float)):
             values = [_round_pt(radius, scale)] * 4
         elif isinstance(radius, (list, tuple)) and radius:
             converted = [_round_pt(item, scale) for item in radius]
             values = (converted + [converted[-1]] * 4)[:4]
         else:
-            return radius
+            return None  # 未知类型，不透传噪声
 
     if not values:
         return None
