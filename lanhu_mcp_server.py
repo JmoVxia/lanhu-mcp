@@ -3197,12 +3197,15 @@ class LanhuExtractor:
         """
         生成多倍图下载 URL（OSS image/resize 参数）。
 
-        蓝湖切图只存一张图（stored = logical × sliceScale，通常 2x）。
+        蓝湖 MasterGo/Sketch JSON 的 image.size 是 Web @1x 像素尺寸，
+        原图通常是 Web @2x（即 ``image.size × sliceScale``）。以本次核对的
+        42pt 图标为例，蓝湖面板显示 iOS @1x=42、@2x=84、@3x=126，
+        Web @1x=84、@2x=168；因此 iOS 逻辑点尺寸是原图的 1/4。
         不同倍率通过 OSS x-oss-process=image/resize 实现在线裁剪。
 
         Args:
-            image_url:   OSS 原图 URL（stored = logical × sliceScale）
-            logical_w/h: 逻辑 1x 尺寸（来自 image.size.width/height 或 ddsImage.size）
+            image_url:   OSS 原图 URL（stored = Web @1x × sliceScale）
+            logical_w/h: Web @1x 尺寸（来自 image.size.width/height 或 ddsImage.size）
             slice_scale: 切图导出倍率（sketch JSON 根节点 sliceScale，通常为 2）
 
         Returns:
@@ -3220,14 +3223,16 @@ class LanhuExtractor:
             w, h = max(1, w), max(1, h)
             if w == stored_w and h == stored_h:
                 return image_url  # 恰好是存储尺寸，无需 resize
-            return f"{image_url}?x-oss-process=image/resize,w_{w},h_{h}/format,png"
+            separator = '&' if '?' in image_url else '?'
+            return f"{image_url}{separator}x-oss-process=image/resize,w_{w},h_{h}/format,png"
 
         def js_round(v: float) -> int:
             """模拟 JavaScript Math.round（.5 向上取整）"""
             import math
             return math.floor(v + 0.5)
 
-        # iOS 按 stored/4 基准（hardcoded by Lanhu frontend）
+        # 蓝湖 iOS 导出按原图的 1/4 作为 @1x；这与 750px 画板对应 375pt、
+        # 以及页面实测的 42/84/126px 完全一致。
         ios_base = stored_w / 4
         return {
             # Web / 通用
@@ -3268,7 +3273,8 @@ class LanhuExtractor:
 
         def make_url(w: int, h: int) -> str:
             w, h = max(1, w), max(1, h)
-            return f"{image_url}?x-oss-process=image/resize,w_{w},h_{h}/format,png"
+            separator = '&' if '?' in image_url else '?'
+            return f"{image_url}{separator}x-oss-process=image/resize,w_{w},h_{h}/format,png"
 
         one_x_w = bw / 2
         one_x_h = bh / 2
@@ -3373,7 +3379,8 @@ class LanhuExtractor:
                     # 优先使用PNG格式，如果没有则使用SVG
                     download_url = image_data.get('imageUrl') or image_data.get('svgUrl')
 
-                    # 逻辑尺寸：image.size 是 1x 逻辑像素（stored = logical × sliceScale）
+                    # image.size 是 Web @1x 像素；iOS 设计点和原图尺寸另行明确输出，
+                    # 避免调用方把 Web 像素误当成 iOS pt。
                     img_size = image_data.get('size') or {}
                     logical_w = img_size.get('width') or 0
                     logical_h = img_size.get('height') or 0
@@ -3404,13 +3411,25 @@ class LanhuExtractor:
 
                     # 多倍图 URL（1x/2x/3x 及各平台倍率）
                     if download_url and image_data.get('imageUrl'):
+                        stored_w = logical_w * slice_scale
+                        stored_h = logical_h * slice_scale
                         slice_info['scale_urls'] = self._build_scale_urls(
                             download_url, logical_w, logical_h, slice_scale
                         )
                         slice_info['logical_size'] = {
                             'width': int(logical_w),
                             'height': int(logical_h),
-                            'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                            'note': '兼容字段：Web @1x 像素，不是 iOS pt',
+                        }
+                        slice_info['ios_point_size'] = {
+                            'width': round(stored_w / 4, 2),
+                            'height': round(stored_h / 4, 2),
+                            'note': '蓝湖 iOS 标注中的 pt 尺寸；iOS @1x/@2x/@3x 对应 1/2/3 倍',
+                        }
+                        slice_info['source_size'] = {
+                            'width': int(stored_w),
+                            'height': int(stored_h),
+                            'note': f'原始 PNG 像素，通常为 Web @{slice_scale}x',
                         }
 
                     # 添加位置信息
@@ -3504,7 +3523,17 @@ class LanhuExtractor:
                     slice_info['logical_size'] = {
                         'width': int(logical_w),
                         'height': int(logical_h),
-                        'note': f'1x logical px; stored at {slice_scale}x = {int(logical_w * slice_scale)}x{int(logical_h * slice_scale)}px'
+                        'note': '兼容字段：Web @1x 像素，不是 iOS pt',
+                    }
+                    slice_info['ios_point_size'] = {
+                        'width': round(logical_w * slice_scale / 4, 2),
+                        'height': round(logical_h * slice_scale / 4, 2),
+                        'note': '蓝湖 iOS 标注中的 pt 尺寸；iOS @1x/@2x/@3x 对应 1/2/3 倍',
+                    }
+                    slice_info['source_size'] = {
+                        'width': int(round(logical_w * slice_scale)),
+                        'height': int(round(logical_h * slice_scale)),
+                        'note': f'原始 PNG 像素，通常为 Web @{slice_scale}x',
                     }
 
                 # 添加位置信息
@@ -5708,12 +5737,13 @@ async def lanhu_get_ai_analyze_design_result(
             3. Design Tokens  — supplementary reference for gradients/borders/shadows
             4. Design Image   — visual verification ONLY, never override real values
 
-        The returned HTML+CSS is the DESIGN SPECIFICATION generated from design schema.
-        Every CSS property value (color, size, spacing, font, gradient, border-radius,
-        etc.) is extracted from the original design data and MUST be used as-is.
+        The returned HTML+CSS is a supplementary design view generated from the schema.
+        lanhu_get_design_structure is authoritative for any property it reports;
+        HTML+CSS may only fill a field that structure explicitly does not report.
 
-        RULE 1 - HTML+CSS IS DESIGN SPEC, COPY CSS VALUES DIRECTLY:
-            The CSS values are the single source of truth for all design parameters.
+        RULE 1 - STRUCTURE FIRST, THEN HTML+CSS FOR UNREPORTED FIELDS:
+            The design_structure values are the single source of truth for reported parameters.
+            CSS values are authoritative only for fields that structure explicitly marks as unavailable.
             You MUST directly copy/reuse the exact CSS property values from the code.
             DO NOT modify, simplify, or "improve" any CSS value. Specifically:
               - DO NOT change rgba() to hex or vice versa (keep rgba(255,115,10,1) as-is)
@@ -5757,14 +5787,16 @@ async def lanhu_get_ai_analyze_design_result(
             for all image resources. A download mapping table is provided below each
             design's HTML code, listing: local_path ← remote_download_url.
             You MUST:
-              1. Download ALL images from the mapping table to the project's local
+              1. Call lanhu_download_design_slices to download ALL required slices to the project's local
                  assets directory BEFORE generating final code.
-              2. Keep using local paths in the generated code. Adapt paths to the
+              2. Check downloaded_count/failed_count/verified; any failure must be fixed or reported,
+                 never silently skipped.
+              3. Keep using local paths in the generated code. Adapt paths to the
                  target framework convention:
                    React/Vue   → import coverImg from '@/assets/slices/cover.png'
                    Flutter     → AssetImage('assets/images/cover.png')
                    Plain HTML  → <img src="./assets/slices/cover.png">
-              3. NEVER use remote lanhu CDN URLs in any generated code.
+              4. NEVER use remote lanhu CDN URLs in any generated code.
             Additionally, call lanhu_get_design_slices(url, design_name) to get the
             full slice list for more fine-grained assets (icons, background images, etc.).
 
@@ -5786,10 +5818,10 @@ async def lanhu_get_ai_analyze_design_result(
 
             Overlay policy: for every property present in design_structure, use ITS value
             as the source of truth and overwrite whatever DDS/HTML/image inferred. If DDS
-            failed, design_structure IS the specification. Only fall back to the DDS/image
-            result for properties design_structure does not report (e.g. exact slice image).
-            This is the reliable way to get correct 圆角/border-radius, 边框, 阴影, 渐变,
-            颜色, 间距 and 字号 — do not skip it.
+            failed or 「设计图转代码」is off, design_structure IS the specification.
+            For properties structure does not report, mark them unconfirmed instead of
+            inventing a value; an HTML/image value may be used only when the user explicitly
+            accepts an approximation.
 
         RULE 5 - POST-GENERATION FIDELITY AUDIT (MANDATORY, NEVER SKIP):
             After generating code in ANY target platform/language (HTML/CSS, React,
@@ -6039,9 +6071,9 @@ async def lanhu_get_ai_analyze_design_result(
         summary_text += "📋 Design List (display order from top to bottom):\n"
         summary_text += "下方图片顺序与列表中「设计图 1」「设计图 2」… 一一对应，请按序号关联图片与代码。\n\n"
         summary_text += "🚨 CRITICAL: 设计稿代码使用流程（必须按顺序执行）\n"
-        summary_text += "以下 HTML+CSS 是从设计稿 Schema 生成的【设计规格书】，是所有设计参数的权威来源。\n"
-        summary_text += "⚠️ 权威优先级: HTML+CSS 代码 > Design Tokens 标注 > 设计图图片\n"
-        summary_text += "⚠️ 核心原则: 直接复用 CSS 属性值，禁止修改/简化/美化任何 CSS 值\n\n"
+        summary_text += "以下 HTML+CSS 是从设计稿 Schema 生成的辅助视图；已由 design_structure 报告的属性以 structure 为准。\n"
+        summary_text += "⚠️ 权威优先级: lanhu_get_design_structure > HTML+CSS > Design Tokens > 设计图图片\n"
+        summary_text += "⚠️ 核心原则: structure 已报告的属性必须原值映射；未报告属性标记 unconfirmed，不得猜测\n\n"
         summary_text += "STEP 1 - 探测用户项目环境：\n"
         summary_text += "  读取项目配置文件（package.json / tsconfig.json / pubspec.yaml / build.gradle / Podfile 等）\n"
         summary_text += "  识别框架: React/Vue/Angular/Svelte/Flutter/SwiftUI/Compose/纯HTML\n"
@@ -6053,10 +6085,8 @@ async def lanhu_get_ai_analyze_design_result(
         summary_text += "  每个设计图下方附有「图片资源下载映射」，列出 本地路径 ← 远程下载地址\n"
         summary_text += "  文件名已按 CSS 类名生成（如 thumbnail_54.png、group_1.png），具备初步语义。\n"
         summary_text += "  ⚠️ 若文件名仍不够语义化，在下载时重命名为更清晰的英文名，并同步更新 HTML 中的路径引用。\n"
-        summary_text += "  必须按映射表下载所有图片到项目本地 assets 目录：\n"
-        summary_text += "    macOS/Linux → curl -o <path> \"<url>\"\n"
-        summary_text += "    Windows → PowerShell Invoke-WebRequest -Uri \"<url>\" -OutFile <path>\n"
-        summary_text += "  如需更多切图（图标、背景等），调用 lanhu_get_design_slices(url, design_name)\n\n"
+        summary_text += "  必须调用 lanhu_download_design_slices 下载所有图片到项目本地 assets 目录，并检查 verified=true；失败项不得静默跳过。\n"
+        summary_text += "  如需更多切图（图标、背景等），先调用 lanhu_get_design_slices(url, design_name) 再执行下载工具。\n\n"
         summary_text += "STEP 3 - 生成框架适配代码（直接复用 CSS 值，禁止修改）：\n"
         summary_text += "  从下方 HTML+CSS 直接复制所有 CSS 属性值（颜色/字号/间距/圆角/渐变等）\n"
         summary_text += "  ⚠️ 必须原样使用 CSS 值，禁止做任何修改：\n"
@@ -6243,7 +6273,7 @@ async def lanhu_get_ai_analyze_design_result(
 async def lanhu_get_design_structure(
         url: Annotated[str, "蓝湖 URL，含 tid 和 pid。支持 detailDetach: ?pid=xxx&image_id=xxx"],
         design_name: Annotated[Optional[str], "设计图名称或序号。可空：此时用 URL 里的 image_id，都没有则返回设计图列表"] = None,
-        max_depth: Annotated[Optional[int], "按需加载省 token：只输出到第 N 层，更深的容器标记 truncated+childCount。可空=全量"] = None,
+        max_depth: Annotated[Optional[int], "显式分页：只输出到第 N 层，更深的容器标记 truncated+childCount。可空=完整树"] = None,
         node_id: Annotated[Optional[str], "按需加载：只输出该 id 起始的子树（用上一次结果里的 node.id 逐分支展开；id 唯一，无撞名歧义）。可空=整棵树"] = None,
         include: Annotated[Optional[list], "段级白名单，控制是否返回冗余汇总：可选 'slices'/'texts'/'tokens'（'nodes' 恒含）。可空=全含；如 ['nodes'] 只回结构树+计数以省 token"] = None,
         child_offset: Annotated[int, "配合 node_id 分页超宽列表：从第 child_offset 个直接子节点开始返回一窗（结果里 nextChildOffset 给出下一页起点）。默认 0"] = 0,
@@ -6264,7 +6294,8 @@ async def lanhu_get_design_structure(
       - 外观: color(背景/填充), gradient{type,stops,from,to,angle}, border[{thickness,color,position,style}],
               radius(数值或 {topLeft,topRight,bottomRight,bottomLeft}), shadow[{color,x,y,blur,spread,inset}],
               blur{type,radius}, opacity, rotation, blendMode, clip(clipsToBounds), backgroundImage/imageUrl
-      - 文本: text, fontSize, fontFamily, fontWeight, color, align, lineHeight, letterSpacing, italic, underline, strikethrough
+              - 文本: text, fontSize, fontFamily, fontWeight, color, align, lineHeight, letterSpacing, italic, underline, strikethrough,
+                      multiStyle, textRuns（逐段范围样式；无法确定范围时标记 textRunsUnparsed）
       - 切图: image 节点内联 imageUrl, format(png/svg), category(icon≤64pt / bg长边≥300pt / img)；
               顶层 slices[] 汇总全部切图，直接可下载，无需再调 DDS。
 
@@ -6273,9 +6304,10 @@ async def lanhu_get_design_structure(
     texts/slices 明细仅在树被截断(骨架/裁剪)时才附上作为补充——完整返回时信息已在 nodes 树内，不重复省 token。
     同一版本设计稿的重复读取/逐分支展开走进程内缓存(json_url 版本键)，跳过重复下载与解析。
 
-    智能渐进按需加载（默认自动，最省 token）：
-      - 默认不带参数：小稿一次返回全量；中大稿自动只返回「能放进 token 预算的最大深度骨架」
-        (progressive=true、truncatedForTokens=true，truncated 容器带 childCount)，再按需展开。
+    完整性约束（优先于省 token）：
+      - 默认不带参数：返回完整节点树；不因 token 预算自动裁剪组件，也不要求 AI 猜测或补全缺失属性。
+      - 只有调用方显式传入 max_depth、node_id 或 child_offset 时才进行深度/子节点分页。
+        一旦结果带 truncated/childrenTruncated，必须继续展开对应容器后才能生成 UI。
       - node_id="2:1038": 展开该节点子树（id 取自上一次结果的 node.id）——渐进的下一步，唯一无歧义。
       - max_depth=N: 显式只输出到第 N 层。单容器子节点超 80 个按广度截断(childrenTruncated)。
       - child_offset=N: 配合 node_id 翻页超宽列表（>80 直接子节点）；结果里 nextChildOffset 给出下一页起点，
@@ -6285,9 +6317,10 @@ async def lanhu_get_design_structure(
       - savedTo: 每次调用都把「完整树」写盘（不受本次返回粒度影响），需要整棵树时可直接读该文件。
 
     USE THIS WHEN: 生成 iOS/Android/Flutter 代码, 需要精确的颜色/圆角/边框/阴影/间距/字号, 切图清单, 设计结构, 图层树, DDS失败兜底
-    DO NOT USE for: 仅需批量下载切图文件 (可用 lanhu_get_design_slices；本工具已给切图 URL)
+    DO NOT USE for: 仅需批量下载切图文件 (使用 lanhu_download_design_slices)
 
-    WORKFLOW: 可先 lanhu_get_designs，再带 design_name 调用。大图先 max_depth=2 看骨架，再用 node_id 深入。
+    WORKFLOW: 可先 lanhu_get_designs，再带 design_name 调用。生成 UI 前优先读取完整树；只有用户明确要求分页或响应过大时，
+    才使用 node_id/child_offset，并把同一组件的所有属性一起展开。
     """
     extractor = LanhuExtractor()
     try:
@@ -6336,6 +6369,8 @@ async def lanhu_get_design_structure(
 
         _usage = (
             '设计属性权威来源：坐标/尺寸/字号为逻辑点(pt)，颜色为 rgb()/rgba()。'
+            '默认返回完整节点树，组件不得按单个属性零散读取；只有显式分页才裁剪。'
+            '出现 truncated/childrenTruncated 时必须继续读取对应组件分支，不能出码或凭截图猜值。'
             '请把每个节点的属性精确叠加到代码——iOS: color→backgroundColor, radius→layer.cornerRadius(dict 用 maskedCorners), '
             'border→layer.borderWidth/borderColor, shadow→layer.shadow*, blur→UIVisualEffectView, '
             'opacity→alpha, clip→clipsToBounds, gradient→CAGradientLayer(用 angle/from/to 定方向)。'
@@ -6388,6 +6423,12 @@ async def lanhu_get_design_structure(
             d = {'sliceScale': full_parsed.get('sliceScale'), 'host': full_parsed.get('host'),
                  'artboard': full_parsed.get('artboard'),
                  'textCount': len(texts), 'sliceCount': len(slices)}
+            d['completeness'] = 'partial' if truncated else 'complete'
+            d['implementation_constraints'] = [
+                'nodes 是设计属性唯一事实来源；缺失属性表示源数据未提供，不得凭截图猜测',
+                '生成一个组件前必须读取该组件完整节点树，并同时处理布局、颜色、字号、字重、透明度、圆角、边框、阴影和切图',
+                '出现 truncated/childrenTruncated 时不得开始出码，先用 node_id/child_offset 取完对应分支',
+            ]
             # 完整返回时 texts/slices 与 nodes 树重复 → 默认省略；被截断时才附上，作为“完整补充”避免漏。
             if _want('texts', truncated):
                 d['texts'] = texts
@@ -6431,7 +6472,6 @@ async def lanhu_get_design_structure(
                 clone['nextChildOffset'] = offset + limit
             return clone
 
-        BUDGET = 16000    # 默认渐进预算（约 8000 token）
         CEILING = 24000   # 硬上限（约 12000 token，远低于 MCP 25000）：任何自动返回都不得超过
 
         base_nodes = full_parsed.get('nodes') or []
@@ -6460,8 +6500,8 @@ async def lanhu_get_design_structure(
             # 仅 node_id：完整子树，过大则在硬上限内自动裁剪
             return _render_within(nodes, summary, CEILING, extra)
 
-        # 智能渐进（默认）：按「实际返回体」是否放得进预算决定——小稿一次全量，中大稿渐进骨架。
-        return _render_within(base_nodes, full_summary, BUDGET)
+        # 默认完整返回。组件级属性不能因为预算门槛被静默删掉；需要分页时由调用方显式选择范围。
+        return _view(base_nodes, full_summary)
     except Exception as exc:
         return {
             'status': 'error',
@@ -6488,7 +6528,8 @@ async def lanhu_get_design_slices(
     WORKFLOW: First call lanhu_get_designs to get design list, then call this to get slices from specific design.
     
     Returns:
-        Slice list with download URLs, AI will handle smart naming and batch download
+        切图清单与倍率地址。需要落盘时必须继续调用 lanhu_download_design_slices，
+        不允许只把 URL 交给用户或假定资源已经下载。
     """
     extractor = LanhuExtractor()
     try:
@@ -6574,11 +6615,11 @@ async def lanhu_get_design_slices(
 
         # 5. Add AI workflow guide
         ai_workflow_guide = {
-            "instructions": "🤖 AI assistant must follow this workflow to process slice download tasks",
+            "instructions": "🤖 切图清单是事实来源；需要文件时必须执行 lanhu_download_design_slices 并检查 status/failed/verified",
             "language_requirement": "⚠️ IMPORTANT: Always respond to user in Chinese (中文回复)",
             "FIRST_ACTION_REQUIRED": {
-                "action": "ASK_USER_SCALE_PREFERENCE",
-                "description": "在开始下载前，必须先向用户确认平台和倍率偏好",
+                "action": "RESOLVE_SCALE_FROM_USER_SCOPE",
+                "description": "只有用户没有说明平台/倍率时才询问；用户已明确 iOS 时直接使用 ios_2x 并校验下载结果",
                 "question_template": "请问您需要下载哪个平台的切图？\n\n**Web 端**\n- `1x` — {w1x}×{h1x}px（CSS 1倍图）\n- `2x` — {w2x}×{h2x}px（Retina / 原图，推荐）\n- `3x` — {w3x}×{h3x}px（超高清）\n\n**iOS**\n- `ios_1x` — @1x\n- `ios_2x` — @2x（同 Web 1x）\n- `ios_3x` — @3x\n\n**Android**\n- `android_xhdpi` — xhdpi（同 Web 1x）\n- `android_xxhdpi` — xxhdpi（同 iOS @3x）\n- `android_xxxhdpi` — xxxhdpi（原图）\n- 全套（mdpi/hdpi/xhdpi/xxhdpi/xxxhdpi）\n\n> 默认推荐：**Web 2x**（最高清，直接使用原图 URL，无需额外处理）",
                 "how_to_use_scale_urls": "每个 slice 的 scale_urls 字段包含所有倍率的 URL，根据用户选择取对应 key 的 URL 下载即可",
                 "scale_url_keys": {
@@ -6603,13 +6644,13 @@ async def lanhu_get_design_slices(
             "workflow_steps": [
                 {
                     "step": 0,
-                    "title": "询问用户下载平台和倍率（必须在下载前完成）",
-                    "mandatory": True,
+                    "title": "确认用户下载范围",
+                    "mandatory": False,
                     "tasks": [
                         "展示切图列表摘要（总数 + 前3个名字）给用户",
                         "列出可选平台：Web（1x/2x/3x）、iOS（@1x/@2x/@3x）、Android（全套/单倍率）",
-                        "等待用户明确选择，不要擅自假设默认值",
-                        "若用户不在意，推荐 Web 2x（原图 URL，无 OSS 参数，最简单）"
+                        "用户已明确平台/倍率时直接执行，不重复询问",
+                        "用户未指定时询问一次；用户要求下载时不得停在返回 URL"
                     ]
                 },
                 {
@@ -6713,26 +6754,21 @@ async def lanhu_get_design_slices(
             "execution_workflow": {
                 "description": "Complete workflow that AI must autonomously complete",
                 "steps": [
-                    "Step 0: 展示切图摘要，询问用户需要哪个平台/倍率（必须等待用户回复）",
+                    "Step 0: 确认用户范围；已给出平台/倍率时不得停在询问",
                     "Step 1: Call lanhu_get_design_slices(url, design_name) to get slice info",
-                    "Step 2: Create TODO task plan (use todo_write tool)",
-                    "Step 3: Detect current operating system type",
-                    "Step 4: Detect available download tools by priority",
-                    "Step 5: Identify project type and determine output directory",
-                    "Step 6: 根据用户选择的倍率，从 slice.scale_urls 取对应 URL，生成智能文件名",
-                    "Step 7: Select optimal download solution based on detection results",
-                    "Step 8: Execute batch download task",
-                    "Step 9: Verify download results",
-                    "Step 10: Clean up temporary files and complete TODO"
+                    "Step 2: Identify project asset directory and component naming convention",
+                    "Step 3: Call lanhu_download_design_slices to download the selected scale",
+                    "Step 4: Check downloaded_count/failed_count/verified and report every failure",
+                    "Step 5: 在实现 UI 前，把 structure 的同一组件完整节点树与切图结果一起核对"
                 ]
             },
             "important_notes": [
-                "🎯 AI 必须先询问用户需要下载哪个平台/倍率，不能擅自开始下载",
+                "🎯 用户已说明平台/倍率时直接执行；只有缺少范围时才询问",
                 "📐 每个 slice 都有 scale_urls 字段，包含 1x/2x/3x 及 iOS/Android 全套 URL",
                 "⭐ Web 2x = scale_urls.2x = 原图 URL（无 OSS 参数，最简单），推荐首选",
                 "🍎 iOS 全套下载：ios_1x/ios_2x/ios_3x，文件名加 @2x/@3x 后缀",
                 "🤖 Android 全套下载：android_mdpi~xxxhdpi，分别放入对应 mipmap 目录",
-                "🎯 AI must proactively complete the entire workflow, don't just return info and wait for user action",
+                "🎯 不能只返回 URL；用户要求下载时必须调用 lanhu_download_design_slices，并核对 verified",
                 "📋 AI must use todo_write tool to create task plan, ensure orderly progress",
                 "🔍 AI must detect environment and tool availability first, then select download solution",
                 "⭐ AI must prefer system built-in tools, avoid third-party dependencies",
@@ -6756,6 +6792,185 @@ async def lanhu_get_design_slices(
             'status': 'error',
             'message': str(e)
         }
+    finally:
+        await extractor.close()
+
+
+@mcp.tool()
+async def lanhu_download_design_slices(
+        url: Annotated[str, "蓝湖 URL，含 pid；detailDetach 链接可直接使用 image_id"],
+        design_name: Annotated[str, "设计图名称或序号，必须定位到单张设计图"],
+        output_dir: Annotated[str, "切图落盘目录。工具会创建目录，但默认不会覆盖已有文件"],
+        scale: Annotated[str, "下载倍率：ios_1x / ios_2x / ios_3x、1x / 2x / 3x，SVG 自动使用矢量原图"] = "ios_2x",
+        slice_names: Annotated[Optional[List[str]], "只下载指定切图名称或 id；为空表示该设计图全部切图"] = None,
+        overwrite: Annotated[bool, "是否覆盖同名本地文件，默认 False"] = False,
+        ctx: Context = None
+) -> dict:
+    """下载并校验蓝湖切图，返回每个文件的本地路径、字节数和 SHA-256。
+
+    这是切图的执行工具，不把下载责任留给调用方：URL 解析、倍率选择、目录写入、重复命名、
+    HTTP 错误和文件签名校验都在这里完成。失败项会逐项返回原因，绝不静默吞掉。
+    """
+    extractor = LanhuExtractor()
+    try:
+        if not output_dir or not str(output_dir).strip():
+            return {'status': 'error', 'message': 'output_dir 不能为空'}
+
+        params = extractor.parse_url(url)
+        image_id = params.get('doc_id')
+        designs_data = None
+        if not image_id:
+            designs_data = await _get_designs_internal(extractor, url)
+            if designs_data.get('status') != 'success':
+                return {'status': 'error', 'message': designs_data.get('message', '获取设计图列表失败')}
+            candidates = []
+            name = str(design_name).strip()
+            if name.isdigit():
+                candidates = [item for item in designs_data.get('designs', [])
+                              if item.get('index') == int(name)]
+            else:
+                candidates = [item for item in designs_data.get('designs', [])
+                              if item.get('name') == name]
+            if len(candidates) != 1:
+                return {
+                    'status': 'error',
+                    'message': '设计图名称未唯一匹配，请使用精确名称或序号',
+                    'available_designs': [item.get('name') for item in designs_data.get('designs', [])],
+                }
+            image_id = candidates[0].get('id')
+
+        slices_data = await extractor.get_design_slices_info(
+            image_id=image_id,
+            team_id=params.get('team_id'),
+            project_id=params.get('project_id'),
+            include_metadata=False,
+        )
+        all_slices = slices_data.get('slices') or []
+        requested = {str(item).strip() for item in (slice_names or []) if str(item).strip()}
+        if requested:
+            matched_slices = [item for item in all_slices
+                              if str(item.get('id')) in requested or item.get('name') in requested]
+            matched_keys = {str(item.get('id')) for item in matched_slices}
+            matched_keys.update(item.get('name') for item in matched_slices)
+            unmatched = sorted(requested - matched_keys)
+            if unmatched:
+                return {
+                    'status': 'error',
+                    'message': '指定切图未全部匹配，已阻止静默漏下载',
+                    'unmatched_slice_names': unmatched,
+                    'available_slices': [item.get('name') for item in all_slices],
+                }
+            all_slices = matched_slices
+        if not all_slices:
+            return {
+                'status': 'error',
+                'message': '该设计图没有可下载切图，已阻止返回空成功结果',
+                'design_id': slices_data.get('design_id'),
+                'design_name': slices_data.get('design_name'),
+            }
+
+        valid_scales = {'1x', '2x', '3x', 'ios_1x', 'ios_2x', 'ios_3x',
+                        'android_mdpi', 'android_hdpi', 'android_xhdpi',
+                        'android_xxhdpi', 'android_xxxhdpi', 'original'}
+        if scale not in valid_scales:
+            return {'status': 'error', 'message': f'不支持的倍率 {scale}，可选值: {sorted(valid_scales)}'}
+
+        target_dir = Path(output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        used_names = set()
+        downloaded, skipped, failed = [], [], []
+        suffixes = {'1x': '', 'ios_1x': '', '2x': '@2x', 'ios_2x': '@2x',
+                    '3x': '@3x', 'ios_3x': '@3x'}
+
+        for index, item in enumerate(all_slices, 1):
+            fmt = str(item.get('format') or 'png').lower()
+            if fmt == 'svg':
+                download_url = item.get('svg_url') or item.get('download_url')
+            elif scale == 'original':
+                download_url = item.get('download_url')
+            else:
+                download_url = (item.get('scale_urls') or {}).get(scale)
+            if not download_url:
+                failed.append({'id': item.get('id'), 'name': item.get('name'),
+                               'error': f'没有 {scale} 的可用下载地址'})
+                continue
+
+            raw_name = str(item.get('name') or f'slice_{index}')
+            stem = re.sub(r'\.(png|svg|jpg|jpeg)$', '', raw_name, flags=re.IGNORECASE)
+            stem = re.sub(r'[^\w\-.\u4e00-\u9fff]+', '_', stem, flags=re.UNICODE).strip('._')
+            stem = stem or f'slice_{index}'
+            stem = f"{stem}{suffixes.get(scale, '')}"
+            extension = '.svg' if fmt == 'svg' else '.png'
+            filename = f'{stem}{extension}'
+            serial = 2
+            while filename in used_names:
+                filename = f'{stem}_{serial}{extension}'
+                serial += 1
+            used_names.add(filename)
+            local_path = target_dir / filename
+
+            if local_path.exists() and not overwrite:
+                try:
+                    existing = local_path.read_bytes()
+                    if not existing:
+                        raise ValueError('已有文件为空')
+                    if fmt == 'png' and not existing.startswith(b'\x89PNG\r\n\x1a\n'):
+                        raise ValueError('已有文件不是有效 PNG 文件')
+                    if fmt == 'svg' and b'<svg' not in existing[:4096].lower():
+                        raise ValueError('已有文件不是有效 SVG 文件')
+                    skipped.append({
+                        'id': item.get('id'), 'name': item.get('name'), 'path': str(local_path),
+                        'bytes': len(existing), 'sha256': hashlib.sha256(existing).hexdigest(),
+                        'reason': '文件已存在且 overwrite=False', 'verified': True,
+                    })
+                except Exception as exc:
+                    failed.append({'id': item.get('id'), 'name': item.get('name'),
+                                   'path': str(local_path), 'error': f'已有文件校验失败: {exc}'})
+                continue
+
+            try:
+                response = await extractor.client.get(download_url)
+                response.raise_for_status()
+                content = response.content
+                if not content:
+                    raise ValueError('下载内容为空')
+                if fmt == 'png' and not content.startswith(b'\x89PNG\r\n\x1a\n'):
+                    raise ValueError('响应不是有效 PNG 文件')
+                if fmt == 'svg' and b'<svg' not in content[:4096].lower():
+                    raise ValueError('响应不是有效 SVG 文件')
+                local_path.write_bytes(content)
+                downloaded.append({
+                    'id': item.get('id'), 'name': item.get('name'), 'path': str(local_path),
+                    'bytes': len(content), 'sha256': hashlib.sha256(content).hexdigest(),
+                    'format': fmt, 'scale': scale, 'verified': True,
+                })
+            except Exception as exc:
+                failed.append({'id': item.get('id'), 'name': item.get('name'),
+                               'path': str(local_path), 'error': str(exc)})
+
+        if failed:
+            status = 'partial' if downloaded or skipped else 'error'
+        elif downloaded:
+            status = 'downloaded'
+        else:
+            status = 'cached'
+        return {
+            'status': status,
+            'design_id': slices_data.get('design_id'),
+            'design_name': slices_data.get('design_name'),
+            'scale': scale,
+            'output_dir': str(target_dir),
+            'requested_count': len(all_slices),
+            'downloaded_count': len(downloaded),
+            'skipped_count': len(skipped),
+            'failed_count': len(failed),
+            'downloaded': downloaded,
+            'skipped': skipped,
+            'failed': failed,
+            'verified': not failed,
+        }
+    except Exception as exc:
+        return {'status': 'error', 'message': str(exc)}
     finally:
         await extractor.close()
 

@@ -24,8 +24,8 @@
 - **不依赖 DDS，稳定不失败** — 直接清洗蓝湖原始 Sketch / Figma / MasterGo JSON，设计师未开启「设计图转代码」也照常工作。
 - **属性齐全，面向客户端** — 坐标/尺寸/字号统一逻辑点 `pt`，颜色统一干净 `rgb()/rgba()`；覆盖颜色、渐变、边框、逐角圆角、阴影、模糊、透明度、旋转、裁剪、字体全套，直接对应 iOS 属性。
 - **父子 + 兄弟布局** — 嵌套 `children` 图层树；容器带 `padding`（子相对父）与 `gaps{direction,gap,align}`（兄弟方向/间距/对齐），直接映射 `UIStackView`/`LinearLayout`，配合绝对坐标完整还原。
-- **超省 token，按需加载** — 默认智能渐进：小稿一次到位，大稿返回带唯一 `id` 的浅骨架，再按 `id` 逐分支展开；几百项的超宽列表可 `child_offset` 翻页，**不会因 MCP 输出上限而漏取**。
-- **切图不丢** — 图片节点内联下载 `imageUrl`，顶层 `slices[]` 汇总；批量下载与命名交给专用工具。
+- **组件完整优先** — 默认返回完整节点树，不因 token 预算静默裁剪组件；只有显式传入 `max_depth`、`node_id` 或 `child_offset` 才分页。结果带 `truncated` / `childrenTruncated` 时，必须继续展开对应组件后再出码。
+- **切图不丢** — 图片节点内联 `imageUrl`，顶层 `slices[]` 汇总；`lanhu_download_design_slices` 负责实际下载、校验和失败明细。
 
 ## 快速开始
 
@@ -78,8 +78,9 @@ https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=xxx
 
 | 工具 | 说明 |
 | --- | --- |
-| **`lanhu_get_design_structure`** | ⭐ 主力：结构化图层树，枚举全部客户端属性 + 切图内联 + 智能按需加载 |
-| `lanhu_get_design_slices` | 批量下载切图资源，自动分类命名 |
+| **`lanhu_get_design_structure`** | ⭐ 主力：结构化图层树，枚举完整客户端属性 + 切图内联；默认完整返回，显式分页 |
+| `lanhu_get_design_slices` | 获取完整切图清单、倍率 URL 与元数据 |
+| `lanhu_download_design_slices` | 实际下载并校验切图，返回本地路径、字节数、SHA-256 与逐项失败原因 |
 | `lanhu_get_designs` | 获取项目下的设计图列表 |
 | `lanhu_get_ai_analyze_design_result` | 生成 HTML+CSS（可选/遗留，走 DDS，属性以 `design_structure` 为准） |
 | `lanhu_get_ai_analyze_page_result` · `lanhu_get_pages` · `lanhu_list_product_documents` | 原型 / Axure / 需求文档（PRD） |
@@ -94,8 +95,8 @@ https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=xxx
 | --- | --- |
 | **布局** | `x, y, width, height`（画板绝对坐标）；容器 `padding{left,top,right,bottom}`（子相对父）、`gaps{direction:row\|column, gap 或 gaps[], align}`（兄弟方向/间距/交叉轴对齐） |
 | **外观** | `color` · `gradient{type,stops,from,to,angle}` · `border[{thickness,color,position,style}]` · `radius`（数值或逐角 `{topLeft,topRight,bottomRight,bottomLeft}`）· `shadow[{color,x,y,blur,spread,inset}]` · `blur{type,radius}` · `opacity` · `rotation` · `blendMode` · `clip` · `backgroundImage` / `backgroundImageMode` |
-| **文本** | `text, fontSize, fontFamily, fontWeight, color, align, verticalAlign, lineHeight, letterSpacing, italic, underline, strikethrough, multiStyle` |
-| **切图** | `image` 节点内联 `imageUrl / format(png\|svg) / category(icon\|bg\|img)`；顶层 `slices[]` 汇总 |
+| **文本** | `text, fontSize, fontFamily, fontWeight, color, align, verticalAlign, lineHeight, letterSpacing, italic, underline, strikethrough, multiStyle, textRuns` |
+| **切图** | `image` 节点内联 `imageUrl / format(png\|svg) / category(icon\|bg\|img)`；顶层 `slices[]` 汇总；切图清单额外给出 `ios_point_size`、`source_size` 与 iOS/Web 全倍率地址 |
 | **主题** | 顶层 `tokens{colors,fonts,fontSizes}`（按使用频率 top-N，便于建 `UIColor` 调色板 / 字体表） |
 
 示例（片段）：
@@ -119,28 +120,32 @@ https://lanhuapp.com/web/#/item/project/detailDetach?pid=xxx&image_id=xxx
 
 **iOS 映射**：`color→backgroundColor` · `radius→layer.cornerRadius`（逐角用 `maskedCorners`）· `border→layer.borderWidth/borderColor` · `shadow→layer.shadow*` · `blur→UIVisualEffectView` · `opacity→alpha` · `clip→clipsToBounds` · `gradient→CAGradientLayer`（用 `angle/from/to` 定方向）· `gaps→UIStackView(axis/spacing/alignment)`。
 
-## 按需加载与超大设计稿
+## 完整读取与超大设计稿
 
-> 目标：**用最少的 token 精确读取，且再大的稿也不会因 MCP 输出上限而漏取。**
+> 目标：**组件级属性完整优先；需要省 token 时只能显式分页，不能静默丢字段。**
 
 `lanhu_get_design_structure` 的参数：
 
 | 参数 | 作用 |
 | --- | --- |
-| *（默认，无参）* | 智能渐进：小稿一次全量；中大稿自动返回「能放进 token 预算的最大深度骨架」，被截断的容器标记 `truncated` + `childCount` |
+| *（默认，无参）* | 返回完整节点树，不因 token 预算自动裁剪；每个节点保留布局、视觉、文本和切图属性 |
 | `node_id` | 展开某节点子树（`id` 取自上一次结果的 `node.id`），唯一无撞名歧义——渐进的下一步 |
 | `child_offset` | 配合 `node_id` **翻页超宽列表**（>80 直接子节点）：结果里 `nextChildOffset` 给出下一页起点，几百项也能逐页取全 |
 | `max_depth` | 显式只输出到第 N 层 |
 | `include` | 段级白名单（`nodes`/`texts`/`slices`/`tokens`），如 `['nodes']` 只回结构树省 token |
 
-机制：**完整树始终解析并写盘（`savedTo`），返回体只给当前所需**。同一版本重复读取/逐分支展开走进程内缓存（`json_url` 版本键），跳过重复下载与解析；版本变化自动失效。
+机制：**完整树始终解析并写盘（`savedTo`），默认返回完整树；只有显式分页时才返回局部视图**。同一版本重复读取/逐分支展开走进程内缓存（`json_url` 版本键），跳过重复下载与解析；版本变化自动失效。
 
 典型流程：
 
 ```
-默认调用 → 浅骨架（每节点带 id，truncated 容器带 childCount）
-  → node_id=<目标容器 id> 展开该分支
-    → 若是超宽列表：child_offset=0 / nextChildOffset 逐页翻
+默认调用 → 完整节点树（每节点带 id）
+  → 只有需要控制输出时才用 node_id=<目标容器 id> 展开该分支
+    → 若是超宽列表：child_offset=0 / nextChildOffset 逐页翻，直到没有 nextChildOffset
+
+富文本的 `textRuns` 必须整体应用。例如“曝光提升 3 倍”的数字 `3` 应为 `#FC9B40`、16pt、
+`Source Han Sans-Medium`、`fontWeight=500`；不要用整句默认样式覆盖局部样式。图层级 `opacity`
+与文字颜色是两个独立属性，必须同时处理，例如副文案是 `#66676C` + `opacity=0.5`。
 ```
 
 ## 架构原则：不依赖 DDS

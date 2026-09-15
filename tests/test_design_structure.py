@@ -80,6 +80,89 @@ def test_parse_issue85_text_style_shape():
     assert parsed['texts'][0]['color'] == '#969BA3'
 
 
+def test_text_keeps_layer_opacity_and_rich_text_runs():
+    sketch = {
+        'meta': {'host': {'name': 'master'}, 'sliceScale': 2},
+        'artboard': {
+            'name': '弹窗', 'type': 'artboard',
+            'frame': {'left': 0, 'top': 0, 'width': 750, 'height': 1624},
+            'layers': [{
+                'id': 'subtitle', 'name': '录制声音名片，让更多人听见你的声音',
+                'type': 'textLayer', 'visible': True, 'opacity': 0.5,
+                'frame': {'left': 108, 'top': 1181, 'width': 534, 'height': 35},
+                'text': {
+                    'style': {
+                        'content': '录制声音名片，让更多人听见你的声音',
+                        'font': {'type': 'Regular', 'name': 'Source Han Sans', 'size': 24, 'align': 'center'},
+                    },
+                },
+                'style': {'fills': [{'isEnabled': True, 'color': {'value': '#66676C'}}]},
+            }, {
+                'id': 'stat', 'name': '曝光提升 3 倍', 'type': 'textLayer', 'visible': True,
+                'frame': {'left': 34.5, 'top': 1366, 'width': 171, 'height': 46},
+                'text': {
+                    'style': {
+                        'content': '曝光提升 3 倍',
+                        'font': {'type': 'Regular', 'name': 'Source Han Sans', 'size': 28, 'align': 'left'},
+                    },
+                    'styles': [
+                        {'start': 0, 'length': 5, 'text': '曝光提升',
+                         'font': {'type': 'Regular', 'name': 'Source Han Sans', 'size': 28},
+                         'color': {'value': '#66676C'}},
+                        {'start': 5, 'length': 1, 'text': '3',
+                         'font': {'type': 'Medium', 'name': 'Source Han Sans-Medium', 'size': 32},
+                         'color': {'value': '#FC9B40'}},
+                        {'start': 6, 'length': 2, 'text': ' 倍',
+                         'font': {'type': 'Regular', 'name': 'Source Han Sans', 'size': 28},
+                         'color': {'value': '#66676C'}},
+                    ],
+                },
+            }],
+        },
+    }
+
+    nodes = {node['id']: node for node in parse_design_structure(sketch)['nodes']}
+    subtitle = nodes['subtitle']
+    assert subtitle['color'] == '#66676C'
+    assert subtitle['opacity'] == 0.5
+
+    stat = nodes['stat']
+    assert stat['multiStyle'] is True
+    digit = stat['textRuns'][1]
+    assert digit['start'] == 5 and digit['length'] == 1
+    assert digit['fontFamily'] == 'Source Han Sans-Medium'
+    assert digit['fontWeight'] == 500
+    assert digit['fontSize'] == 16
+    assert digit['color'] == '#FC9B40'
+
+
+def test_text_info_rich_text_runs_are_not_dropped():
+    sketch = {
+        'meta': {'sliceScale': 2},
+        'layers': [{
+            'id': 'legacy-rich-text', 'name': 'legacy', 'type': 'text',
+            'frame': {'x': 0, 'y': 0, 'width': 200, 'height': 40},
+            'textInfo': {
+                'text': 'A3', 'size': 28, 'fontName': 'Source Han Sans-Regular',
+                'styles': [
+                    {'start': 0, 'length': 1, 'fontName': 'Source Han Sans-Regular',
+                     'fontSize': 28, 'color': '#66676C'},
+                    {'start': 1, 'length': 1, 'fontName': 'Source Han Sans-Medium',
+                     'fontSize': 32, 'fontWeight': 500, 'color': '#FC9B40'},
+                ],
+            },
+        }],
+    }
+
+    node = parse_design_structure(sketch)['nodes'][0]
+    assert node['multiStyle'] is True
+    assert node['textRuns'][1] == {
+        'start': 1, 'length': 1, 'fontSize': 16,
+        'fontFamily': 'Source Han Sans-Medium', 'fontWeight': 500,
+        'color': '#FC9B40',
+    }
+
+
 def _mastergo_shape(name, w, h, *, paths=None, fills=None, borders=None,
                     shadows=None, blurs=None, left=0, top=0):
     return {

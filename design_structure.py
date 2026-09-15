@@ -37,7 +37,22 @@ def _color_to_css(color) -> Optional[str]:
     if not color:
         return None
     if isinstance(color, str):
-        return color
+        value = color.strip()
+        if not value:
+            return None
+        # 部分蓝湖版本把通道序列化成带很多小数位的 CSS 字符串，不能原样交给 iOS。
+        import re
+        match = re.fullmatch(r'rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)', value, re.I)
+        if match:
+            r, g, b = (round(float(match.group(i))) for i in (1, 2, 3))
+            alpha = float(match.group(4)) if match.group(4) is not None else 1
+            if alpha > 1:
+                alpha /= 100
+            if alpha < 1 or value.lower().startswith('rgba('):
+                alpha_value = int(alpha) if alpha == int(alpha) else round(alpha, 3)
+                return f"rgba({r},{g},{b},{alpha_value})"
+            return f"rgb({r},{g},{b})"
+        return value
     if not isinstance(color, dict):
         return None
     # 优先用 r/g/b 计算干净的整数值；MasterGo/DDS 的 value 字符串常带浮点脏值
@@ -47,19 +62,25 @@ def _color_to_css(color) -> Optional[str]:
     b = color.get('b', color.get('blue'))
     a = color.get('a', color.get('alpha', 1))
     if r is not None and g is not None and b is not None:
-        if all(isinstance(item, (int, float)) and abs(item) <= 1 for item in (r, g, b)):
+        try:
+            r, g, b = float(r), float(g), float(b)
+        except (TypeError, ValueError):
+            return None
+        if all(abs(item) <= 1 for item in (r, g, b)):
             r, g, b = round(r * 255), round(g * 255), round(b * 255)
         else:
-            r, g, b = round(float(r)), round(float(g)), round(float(b))
+            r, g, b = round(r), round(g), round(b)
         try:
             alpha = float(a) if a is not None else 1
         except (TypeError, ValueError):
-            alpha = 1
+            return None
+        if alpha > 1:
+            alpha /= 100
         if alpha < 1:
             return f"rgba({r},{g},{b},{round(alpha, 3)})"
         return f"rgb({r},{g},{b})"
     if color.get('value'):
-        return color['value']
+        return _color_to_css(color['value'])
     return None
 
 
@@ -76,37 +97,58 @@ def _first_fill_color(layer: dict) -> Optional[str]:
         if not isinstance(fill, dict) or fill.get('isEnabled') is False:
             continue
         css = _color_to_css(fill.get('color'))
+        fill_opacity = fill.get('opacity')
+        if isinstance(fill_opacity, dict):
+            fill_opacity = fill_opacity.get('value')
+        if css and isinstance(fill_opacity, (int, float)):
+            if fill_opacity > 1:
+                fill_opacity /= 100
+            css = _apply_alpha(css, float(fill_opacity))
         if css:
             return css
     return None
 
 
 def _apply_alpha(css: Optional[str], alpha: float) -> Optional[str]:
-    """Fold a 0-1 alpha into an rgb() css string; leave rgba()/None untouched."""
+    """Fold a 0-1 alpha into a CSS color without losing an existing alpha."""
     if not css or alpha is None or alpha >= 1:
         return css
+    import re
+    if css.startswith('rgba('):
+        match = re.fullmatch(r'rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)', css)
+        if match:
+            existing = float(match.group(4))
+            return f"rgba({match.group(1)},{match.group(2)},{match.group(3)},{round(existing * alpha, 3)})"
     if css.startswith('rgb(') and not css.startswith('rgba('):
         inner = css[4:-1]
         return f"rgba({inner},{round(alpha, 2)})"
+    if re.fullmatch(r'#[0-9a-fA-F]{6}', css):
+        r, g, b = (int(css[i:i + 2], 16) for i in (1, 3, 5))
+        return f"rgba({r},{g},{b},{round(alpha, 2)})"
     return css
 
 
 def _extract_opacity(layer: dict) -> Optional[float]:
-    """Layer opacity as 0-1; None when fully opaque/absent. Handles Figma (0-1) and PSD blendOptions (0-100)."""
-    op = layer.get('opacity')
-    if op is None:
+    """Layer opacity as 0-1; None only when the source has no opacity value.
+
+    保留显式的 1.0。这样调用方能区分“设计稿明确为 100%”与“源数据没有提供该属性”，
+    不会把缺失属性误当成默认值。
+    """
+    missing = object()
+    op = layer.get('opacity', missing)
+    if op is missing or op is None:
         blend = layer.get('blendOptions')
         if isinstance(blend, dict):
-            raw = blend.get('opacity')
+            raw = blend.get('opacity', missing)
             if isinstance(raw, dict):
-                raw = raw.get('value')
-            if raw is not None:
+                raw = raw.get('value', missing)
+            if raw is not missing and raw is not None:
                 try:
                     raw = float(raw)
                     op = raw / 100 if raw > 1 else raw
                 except (TypeError, ValueError):
-                    op = None
-    if op is None:
+                    return None
+    if op is missing or op is None:
         return None
     try:
         op = float(op)
@@ -114,7 +156,7 @@ def _extract_opacity(layer: dict) -> Optional[float]:
         return None
     if op > 1:  # DDS/PSD 用 0-100
         op = op / 100
-    if op < 0 or op >= 1:
+    if op < 0 or op > 1:
         return None
     return round(op, 2)
 
@@ -589,7 +631,15 @@ def _normalize_font_weight(value) -> Optional[Union[int, str]]:
         return None
     if isinstance(value, (int, float)):
         return int(value)
-    mapped = _FONT_WEIGHT_NAME_MAP.get(str(value).lower())
+    normalized = str(value).lower().strip()
+    mapped = _FONT_WEIGHT_NAME_MAP.get(normalized)
+    if mapped is None:
+        # 某些导出把字体家族后缀（如 Source Han Sans-Medium）放进 weight 字段。
+        # 仅匹配已知权重词，避免把任意字体名误判成可执行字重。
+        for name in sorted(_FONT_WEIGHT_NAME_MAP, key=len, reverse=True):
+            if name in normalized:
+                mapped = _FONT_WEIGHT_NAME_MAP[name]
+                break
     return mapped if mapped is not None else value
 
 
@@ -612,6 +662,89 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
     """MasterGo artboard / Figma textStyle / Sketch textInfo."""
     props = {}
 
+    def _style_props(source: dict) -> dict:
+        """把一个富文本片段的可落地属性统一成 iOS 可用字段。"""
+        if not isinstance(source, dict):
+            return {}
+        style = source.get('style') if isinstance(source.get('style'), dict) else source
+        font = style.get('font') if isinstance(style.get('font'), dict) else style
+        out = {}
+
+        size = font.get('size', style.get('fontSize'))
+        if size is not None:
+            out['fontSize'] = _round_pt(size, scale)
+        family = (font.get('name') or font.get('postScriptName') or
+                  style.get('fontFamily') or style.get('fontName'))
+        if family:
+            out['fontFamily'] = family
+        weight = font.get('fontWeight', font.get('type', style.get('fontWeight')))
+        normalized_weight = _normalize_font_weight(weight)
+        if normalized_weight is not None:
+            out['fontWeight'] = normalized_weight
+        color = (style.get('color') or style.get('foregroundColor') or
+                 source.get('color') or source.get('foregroundColor'))
+        if color:
+            out['color'] = _color_to_css(color)
+        align = font.get('align', style.get('align'))
+        if align not in (None, ''):
+            out['align'] = _normalize_align(align)
+        vertical = font.get('verticalAlignment', style.get('verticalAlign'))
+        if vertical not in (None, ''):
+            out['verticalAlign'] = vertical
+        line_height = font.get('lineHeight', font.get('leading', style.get('lineHeight')))
+        if isinstance(line_height, dict):
+            line_height = line_height.get('value')
+        if isinstance(line_height, (int, float)) and line_height != 0:
+            out['lineHeight'] = _round_pt(line_height, scale)
+        spacing = font.get('letterSpacing', font.get('tracking', style.get('letterSpacing')))
+        if isinstance(spacing, dict):
+            spacing = spacing.get('value')
+        if isinstance(spacing, (int, float)) and spacing != 0:
+            out['letterSpacing'] = _round_pt(spacing, scale)
+        if font.get('italic') or style.get('italic') or 'italic' in str(font.get('type', '')).lower():
+            out['italic'] = True
+        if font.get('underline') or style.get('underline'):
+            out['underline'] = True
+        if font.get('linethrough') or font.get('strikethrough') or style.get('strikethrough'):
+            out['strikethrough'] = True
+        return {key: value for key, value in out.items() if value not in (None, '')}
+
+    def _extract_text_runs(raw_text_obj: dict) -> list:
+        raw_runs = (raw_text_obj.get('styles') or raw_text_obj.get('runs') or
+                    raw_text_obj.get('textStyles') or
+                    (raw_text_obj.get('style') or {}).get('styles') or [])
+        if not isinstance(raw_runs, list) or len(raw_runs) <= 1:
+            return []
+
+        text_runs = []
+        for raw_run in raw_runs:
+            if not isinstance(raw_run, dict):
+                continue
+            run = {}
+            raw_range = raw_run.get('range') or raw_run.get('textRange') or {}
+            if not isinstance(raw_range, dict):
+                raw_range = {}
+            start = raw_run.get('start', raw_run.get('from', raw_run.get('location',
+                         raw_range.get('start', raw_range.get('from', raw_range.get('location'))))))
+            length = raw_run.get('length', raw_run.get('len', raw_range.get('length')))
+            end = raw_run.get('end', raw_run.get('to', raw_range.get('end', raw_range.get('to'))))
+            if length is None and start is not None and end is not None:
+                try:
+                    length = end - start
+                except TypeError:
+                    length = None
+            if start is not None:
+                run['start'] = start
+            if length is not None:
+                run['length'] = length
+            content = raw_run.get('content') or raw_run.get('text') or raw_run.get('value')
+            if content:
+                run['text'] = content
+            run.update(_style_props(raw_run))
+            if run:
+                text_runs.append(run)
+        return text_runs
+
     raw_text = layer.get('text')
     if isinstance(raw_text, dict):
         style = raw_text.get('style') or {}
@@ -625,10 +758,18 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
         if font.get('verticalAlignment') not in (None, ''):
             props['verticalAlign'] = font.get('verticalAlignment')  # top/middle/bottom，iOS 竖直对齐
         props['color'] = _color_to_css(style.get('color'))
-        # 富文本多段样式：仅取首段，标记以便调用方知道存在逐段差异（完整分段见原始数据）
-        runs = raw_text.get('styles')
-        if isinstance(runs, list) and len(runs) > 1:
+        # 富文本不能只返回一个布尔值，否则“曝光提升 3 倍”的局部样式会被 AI 猜掉。
+        text_runs = _extract_text_runs(raw_text)
+        if text_runs:
             props['multiStyle'] = True
+            props['textRuns'] = text_runs
+            if any('start' not in run or 'length' not in run for run in text_runs):
+                props['textRunsUnparsed'] = True
+        raw_runs = (raw_text.get('styles') or raw_text.get('runs') or raw_text.get('textStyles') or
+                    (raw_text.get('style') or {}).get('styles') or [])
+        if isinstance(raw_runs, list) and len(raw_runs) > 1 and not text_runs:
+            props['multiStyle'] = True
+            props['textRunsUnparsed'] = True
     elif isinstance(raw_text, str) and raw_text:
         props['text'] = raw_text
 
@@ -657,6 +798,20 @@ def _extract_text_props(layer: dict, scale: float) -> dict:
             props.setdefault('color', _color_to_css(text_info.get('color')))
         if text_info.get('justification') is not None:
             props.setdefault('align', _normalize_align(text_info.get('justification')))
+
+        # 旧版 Sketch/PS 有时把富文本片段挂在 textInfo，而不是 text 对象。
+        # 仍然输出可执行的区间样式，不能因为来源不同退化成只读整句样式。
+        text_runs = _extract_text_runs(text_info)
+        if text_runs:
+            props['multiStyle'] = True
+            props['textRuns'] = text_runs
+            if any('start' not in run or 'length' not in run for run in text_runs):
+                props['textRunsUnparsed'] = True
+        raw_runs = (text_info.get('styles') or text_info.get('runs') or
+                    text_info.get('textStyles') or [])
+        if isinstance(raw_runs, list) and len(raw_runs) > 1 and not text_runs:
+            props['multiStyle'] = True
+            props['textRunsUnparsed'] = True
 
     # 行高 / 字间距 / 斜体（各来源尽力取，逻辑点）
     font = {}
@@ -828,7 +983,7 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
     walked, including groups that also have export images.
 
     每个节点带稳定唯一 id（原始图层 id），作为定位/回指句柄，避免撞名歧义。
-    按需加载（省 token）：
+    显式按需加载（只有调用方传参才裁剪，默认完整）：
       - max_depth: 只输出到指定层级，更深的 container 标记 truncated+childCount；
         单个容器子节点超 80 个时按广度截断（childrenTruncated+childCount），超宽扁平分支也能返回。
       - node_id: 只输出该 id 起始的子树（配合上一次结果里的 node.id 逐分支展开）。
@@ -890,6 +1045,12 @@ def parse_design_structure(sketch_data: dict, max_depth: Optional[int] = None,
         if is_text and not is_group:
             node['type'] = 'text'
             node.update(_extract_text_props(layer, slice_scale))
+            # 文本也可能带图层级透明度、阴影、旋转、裁剪等属性。此前这里提前返回，
+            # 使这些属性在文本节点上全部丢失（例如蓝湖副文案的 50% opacity）。
+            # color 仍保留为文字前景色，避免被 fills 中的同名值覆盖。
+            text_box_style = _extract_box_style(layer, slice_scale, frame)
+            text_box_style.pop('color', None)
+            node.update(text_box_style)
             return node
 
         # 补充：容器/形状统一提取填充色、边框、圆角、阴影、模糊、透明度、裁剪
